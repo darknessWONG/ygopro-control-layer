@@ -334,6 +334,16 @@ std::string QueryParam(const std::string& query, const std::string& key);
 bool ExecuteAction(const Action& a);
 std::vector<unsigned char> Unhex(const std::string& s);
 
+// control_ui.cpp
+bool ExecUiAction(const Action& a);
+void ApplyChainMode(const char* why);
+void UiCleanup(const char* why);
+void CloseEmptyFrames();
+void LogVisibleWindows();
+
+// control_lobby.cpp
+bool ExecLobbyAction(const Action& a);
+
 } // namespace ctl
 } // namespace ygo
 
