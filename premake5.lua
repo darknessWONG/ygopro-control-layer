@@ -10,9 +10,9 @@
 
 --- Use global variables to share settings across different scripts.
 
-USE_DXSDK = true
+USE_DXSDK = false
 
-USE_AUDIO = true
+USE_AUDIO = false
 AUDIO_LIB = "miniaudio" -- only miniaudio is supported for now
 
 -- Available: none, sse2, avx2, neon, best

@@ -2,9 +2,11 @@
 #define DUELCLIENT_H
 
 #include <vector>
+#include <mutex>
 #include "bufferio.h"
 #include "deck.h"
 #include "network.h"
+#include "control.h"
 
 namespace ygo {
 
@@ -17,6 +19,8 @@ namespace ygo {
 #define CLIENT_CLOSE_REASON_STOP	1
 #define CLIENT_CLOSE_REASON_EXIT	2
 
+extern std::mutex g_netWriteMutex; // serialises bufferevent writes (LAN host: server thread + game thread share one bev)
+
 class DuelClient {
 private:
 	static bufferevent* client_bev;
@@ -25,6 +29,7 @@ private:
 
 public:
 	static unsigned char selftype;
+	static bool IsConnected() { return client_bev != nullptr; }
 	static bool StartClient(unsigned int ip, unsigned short port, bool create_game = true);
 	static void ConnectTimeout(EventSocket fd, short events, void* arg);
 	static void StopClient(unsigned reason = CLIENT_CLOSE_REASON_STOP);
@@ -39,6 +44,7 @@ public:
 	static void SendResponse();
 	static void SendUpdateDeck(const Deck& deck);
 	static void SendPacketToServer(unsigned char proto) {
+		Control::OnCtosPacket(proto);
 		auto p = duel_client_write;
 		BufferIO::Write<uint16_t>(p, 1);
 		BufferIO::Write<uint8_t>(p, proto);
@@ -46,6 +52,7 @@ public:
 	}
 	template<typename ST>
 	static void SendPacketToServer(unsigned char proto, const ST& st) {
+		Control::OnCtosPacket(proto);
 		auto p = duel_client_write;
 		static_assert(sizeof(ST) <= MAX_DATA_SIZE, "Packet size is too large.");
 		BufferIO::Write<uint16_t>(p, (uint16_t)(1 + sizeof(ST)));

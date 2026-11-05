@@ -4,6 +4,7 @@
 #include "single_duel.h"
 #include "netserver.h"
 #include "game.h"
+#include "control.h"
 #include "data_manager.h"
 #include "deck_manager.h"
 #include "../ocgcore/mtrandom.h"
@@ -241,6 +242,7 @@ void SingleDuel::ToObserver(DuelPlayer* dp) {
 	NetServer::SendPacketToPlayer(dp, STOC_TYPE_CHANGE, sctc);
 }
 void SingleDuel::PlayerReady(DuelPlayer* dp, bool is_ready) {
+	Control::Log("PlayerReady: type=%d ready=%d", (int)dp->type, (int)is_ready);
 	if(dp->type > 1)
 		return;
 	if(ready[dp->type] == is_ready)
@@ -255,6 +257,7 @@ void SingleDuel::PlayerReady(DuelPlayer* dp, bool is_ready) {
 			}
 		}
 		if(deckerror) {
+			Control::Log("PlayerReady: deckerror type=%d code=0x%08x main=%d extra=%d side=%d", (int)dp->type, (unsigned)deckerror, (int)pdeck[dp->type].main.size(), (int)pdeck[dp->type].extra.size(), (int)pdeck[dp->type].side.size());
 			STOC_HS_PlayerChange scpc;
 			scpc.status = (dp->type << 4) | PLAYERCHANGE_NOTREADY;
 			NetServer::SendPacketToPlayer(dp, STOC_HS_PLAYER_CHANGE, scpc);
@@ -323,6 +326,7 @@ void SingleDuel::UpdateDeck(DuelPlayer* dp, unsigned char* pdata, unsigned int l
 	}
 }
 void SingleDuel::StartDuel(DuelPlayer* dp) {
+	Control::Log("StartDuel: dp=%p host=%p same=%d ready=%d/%d", (void*)dp, (void*)host_player, (int)(dp == host_player), (int)ready[0], (int)ready[1]);
 	if(dp != host_player)
 		return;
 	if(!ready[0] || !ready[1])

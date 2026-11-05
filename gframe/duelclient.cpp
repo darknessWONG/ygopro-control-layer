@@ -12,6 +12,7 @@
 #include "game.h"
 #include "deck_manager.h"
 #include "replay.h"
+#include "control.h"
 #include "mysocket.h"
 #include <event2/event.h>
 #include <event2/bufferevent.h>
@@ -63,13 +64,16 @@ namespace {
 bufferevent* DuelClient::client_bev = 0;
 unsigned char DuelClient::duel_client_write[SIZE_NETWORK_BUFFER]{};
 unsigned char DuelClient::selftype = 0;
+std::mutex g_netWriteMutex;
 std::vector<HostPacket> DuelClient::hosts;
 
 int DuelClient::WriteBufferEvent(bufferevent* bufev, const void* data, size_t size) {
+	std::lock_guard<std::mutex> lk(g_netWriteMutex);
 	return bufferevent_write(bufev, data, size);
 }
 
 bool DuelClient::StartClient(unsigned int ip, unsigned short port, bool create_game) {
+	Control::Log("StartClient enter ip=0x%08x port=%d create=%d base=%p", (unsigned)ip, (int)port, (int)create_game, (void*)client_base);
 	if(connect_state != CONNECT_STATE_NONE)
 		return false;
 	sockaddr_in sin;
@@ -122,6 +126,7 @@ void DuelClient::ConnectTimeout(EventSocket fd, short events, void* arg) {
 		event_base_loopbreak(client_base);
 }
 void DuelClient::StopClient(unsigned reason) {
+	Control::Log("StopClient reason=%u", reason);
 	close_reason = reason;
 	if(connect_state == CONNECT_STATE_NONE)
 		return;
@@ -145,6 +150,7 @@ void DuelClient::ClientRead(bufferevent* bev, void* ctx) {
 	}
 }
 void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
+	Control::Log("ClientEvent events=0x%x", (int)events);
 	if (events & BEV_EVENT_CONNECTED) {
 		bool create_game = (intptr_t)ctx;
 		if(!create_game) {
@@ -282,11 +288,15 @@ void DuelClient::ClientThread() {
 void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 	unsigned char* pdata = data;
 	unsigned char pktType = BufferIO::Read<uint8_t>(pdata);
+	Control::OnStocPacket(pktType, pdata, len > 1 ? len - 1 : 0);
 	switch(pktType) {
 	case STOC_GAME_MSG: {
 		if (len < 1 + sizeof(unsigned char))
 			return;
+		Control::EnsureStarted();
+		Control::OnMessageBegin(pdata, len - 1);
 		ClientAnalyze(pdata, len - 1);
+		Control::OnAnalyzeEnd();
 		break;
 	}
 	case STOC_ERROR_MSG: {
@@ -398,10 +408,14 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		break;
 	}
 	case STOC_SELECT_HAND: {
+		if (Control::AutoHandResult())
+			break;
 		mainGame->wHand->setVisible(true);
 		break;
 	}
 	case STOC_SELECT_TP: {
+		if (Control::AutoTpResult())
+			break;
 		mainGame->gMutex.lock();
 		mainGame->PopupElement(mainGame->wFTSelect);
 		mainGame->gMutex.unlock();
@@ -859,6 +873,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		const size_t chat_msg_len = chat_msg_size / sizeof(uint16_t);
 		if (chat_msg[chat_msg_len - 1] != 0)
 			return;
+		Control::OnChat(chat_msg, chat_msg_len);
 		int player = chat_player_type;
 		auto play_sound = false;
 		if(player < 4) {
@@ -932,6 +947,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		const auto* pkt = &packet;
 		unsigned char pos = (pkt->status >> 4) & 0xf;
 		unsigned char state = pkt->status & 0xf;
+		Control::OnHsChange(pkt->status);
 		if(pos > 3)
 			break;
 		mainGame->gMutex.lock();

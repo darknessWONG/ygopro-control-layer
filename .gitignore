@@ -36,8 +36,19 @@
 /lzma
 /zlib
 /gframe/*.ico
+/gframe/*.icns
 /gframe/ygopro.rc
 /gframe/ygopro.aps
 /premake5
 /premake5.exe
 /pack
+
+# build artifacts / local downloads (refactor baseline)
+/buildtmp/
+/sqlite.zip
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
