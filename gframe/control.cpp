@@ -174,19 +174,6 @@ bool g_closeEmpty{ true };                // env YGO_UI_CLOSE_EMPTY=0 disables o
 UiPendingVerify g_uiPending;
 
 /** short hex dump for responses: "response: prompt=16 kind=int val=-1 hex=ffffffff" */
-static std::string HexBytes(const unsigned char* p, size_t n) {
-	static const char* kHex = "0123456789abcdef";
-	std::string s;
-	s.reserve(n * 2);
-	for (size_t i = 0; i < n; ++i) {
-		s.push_back(kHex[p[i] >> 4]);
-		s.push_back(kHex[p[i] & 0xf]);
-	}
-	return s;
-}
-
-/** wchar_t* (client text) -> UTF-8 for JSON */
-
 const char* StocName(int id) {
 	switch (id) {
 	case 0x01: return "STOC_GAME_MSG";
@@ -361,65 +348,6 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
 std::atomic<bool> g_started{ false };
 
 
-std::vector<unsigned char> Unhex(const std::string& s) {
-	std::vector<unsigned char> out;
-	auto val = [](char c) -> int {
-		if (c >= '0' && c <= '9') return c - '0';
-		if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-		if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-		return -1;
-	};
-	for (size_t i = 0; i + 1 < s.size(); i += 2) {
-		int h = val(s[i]), l = val(s[i + 1]);
-		if (h < 0 || l < 0) break;
-		out.push_back((unsigned char)((h << 4) | l));
-	}
-	return out;
-}
-
-
-
-// ---------------------------------------------------------------------------
-// ExecuteAction: thin dispatcher. UI cases live in control_ui.cpp, lobby/deck
-// cases in control_lobby.cpp; the raw response cases stay here.
-// ---------------------------------------------------------------------------
-bool ExecuteAction(const Action& a) {
-	CtlDbg("ExecuteAction kind=%d", (int)a.kind);
-	switch (a.kind) {
-	case ActionKind::MsgOk:
-	case ActionKind::UiSem:
-	case ActionKind::UiMenu:
-	case ActionKind::UiPoint:
-		return ExecUiAction(a);
-	case ActionKind::Ready:
-	case ActionKind::Deck:
-	case ActionKind::Surrender:
-	case ActionKind::Start:
-	case ActionKind::NotReady:
-	case ActionKind::Join:
-		return ExecLobbyAction(a);
-	case ActionKind::Int32:
-		// Log the exact bytes we hand back: when the server answers MSG_RETRY, this line
-		// (right next to "RETRY after msg=<id>") tells us which prompt got a bad response.
-		Control::Log("response: prompt=%d streak=%llu kind=int val=%d hex=%s",
-			g_lastNonRetryMsgId.load(), (unsigned long long)g_retryStreak.load(), a.i,
-			HexBytes(reinterpret_cast<const unsigned char*>(&a.i), 4).c_str());
-		DuelClient::SetResponseI(a.i);
-		DuelClient::SendResponse();
-		break;
-	case ActionKind::Bytes:
-		Control::Log("response: prompt=%d streak=%llu kind=bytes len=%d hex=%s",
-			g_lastNonRetryMsgId.load(), (unsigned long long)g_retryStreak.load(),
-			(int)a.bytes.size(), HexBytes(a.bytes.data(), a.bytes.size()).c_str());
-		DuelClient::SetResponseB(const_cast<unsigned char*>(a.bytes.data()), a.bytes.size());
-		DuelClient::SendResponse();
-		break;
-	default:
-		break;
-	}
-	return false;
-}
-
 std::string UrlDecode(const std::string& s) {
 	std::string out;
 	for (size_t i = 0; i < s.size(); ++i) {
@@ -460,253 +388,6 @@ std::string QueryParam(const std::string& query, const std::string& key) {
 // The LLM should never assemble kernel packets: the client builds a semantic action
 // list for the current prompt and executes the action the caller picked by id.
 
-struct SemAction {
-	std::string kind;
-	std::string label;
-	int index{ 0 };
-	int ctrl{ 0 }, loc{ 0 }, seq{ 0 };
-	int count{ 1 };
-};
-
-static void AddSem(std::vector<SemAction>& v, const char* kind, const std::string& label, int index, int ctrl, int loc, int seq, int count) {
-	SemAction a;
-	a.kind = kind;
-	a.label = label;
-	a.index = index;
-	a.ctrl = ctrl;
-	a.loc = loc;
-	a.seq = seq;
-	a.count = count;
-	v.push_back(a);
-}
-
-static std::vector<SemAction> BuildSemActions(const Snapshot& s) {
-	std::vector<SemAction> v;
-	char buf[192];
-	switch (s.curMsg) {
-	case MSG_SELECT_IDLECMD: {
-		int i = 0;
-		for (const auto& c : s.summonableList) { snprintf(buf, sizeof buf, "summon #%d code=%u lv=%u%s", i, c.code, c.level, ((c.type & 0x1000) ? " tuner" : "")); AddSem(v, "summon", buf, i, 0, 0, 0, 1); ++i; }
-		i = 0;
-		for (const auto& c : s.spsummonableList) { snprintf(buf, sizeof buf, "special summon #%d code=%u lv=%u%s", i, c.code, c.level, ((c.type & 0x2000) ? " synchro" : ((c.type & 0x800000) ? " xyz" : ((c.type & 0x4000000) ? " link" : "")))); AddSem(v, "spsummon", buf, i, 0, 0, 0, 1); ++i; }
-		i = 0;
-		for (const auto& c : s.msetableList) { snprintf(buf, sizeof buf, "set monster #%d code=%u", i, c.code); AddSem(v, "set_monster", buf, i, 0, 0, 0, 1); ++i; }
-		i = 0;
-		for (const auto& c : s.ssetableList) { snprintf(buf, sizeof buf, "set spell/trap #%d code=%u", i, c.code); AddSem(v, "set_spell", buf, i, 0, 0, 0, 1); ++i; }
-		i = 0;
-		for (const auto& c : s.activatableList) { snprintf(buf, sizeof buf, "activate #%d code=%u", i, c.code); AddSem(v, "activate", buf, i, 0, 0, 0, 1); ++i; }
-		if (s.canBp) AddSem(v, "to_bp", "go to battle phase", 0, 0, 0, 0, 1);
-		AddSem(v, "to_ep", "end phase", 0, 0, 0, 0, 1);
-		break;
-	}
-	case MSG_SELECT_BATTLECMD: {
-		int i = 0;
-		for (const auto& c : s.attackableList) { snprintf(buf, sizeof buf, "attack #%d atk=%d", i, c.atk); AddSem(v, "attack", buf, i, 0, 0, 0, 1); ++i; }
-		AddSem(v, "to_m2", "go to main phase 2", 0, 0, 0, 0, 1);
-		AddSem(v, "end_battle", "end battle phase", 0, 0, 0, 0, 1);
-		break;
-	}
-	case MSG_SELECT_CHAIN: {
-		int i = 0;
-		for (const auto& c : s.chainList) { snprintf(buf, sizeof buf, "chain #%d code=%u", i, c.code); AddSem(v, "chain", buf, i, 0, 0, 0, 1); ++i; }
-		if (!s.chainForced) AddSem(v, "decline", "do not chain", 0, 0, 0, 0, 1);
-		break;
-	}
-	case MSG_SELECT_YESNO:
-	case MSG_SELECT_EFFECTYN:
-		AddSem(v, "yes", "yes", 0, 0, 0, 0, 1);
-		AddSem(v, "no", "no", 0, 0, 0, 0, 1);
-		break;
-	case MSG_SELECT_OPTION: {
-		int i = 0;
-		for (size_t k = 0; k < s.options.size(); ++k) { snprintf(buf, sizeof buf, "option #%d", i); AddSem(v, "option", buf, i, 0, 0, 0, 1); ++i; }
-		AddSem(v, "option", "option 0", 0, 0, 0, 0, 1);
-		break;
-	}
-	case MSG_SELECT_CARD:
-	case MSG_SELECT_TRIBUTE:
-	case MSG_SELECT_UNSELECT_CARD: {
-		const int n = s.selectMin > 0 ? s.selectMin : 1;
-		snprintf(buf, sizeof buf, "select first %d card(s)", n);
-		AddSem(v, "select", buf, 0, 0, 0, 0, n);
-		break;
-	}
-	case MSG_SELECT_POSITION:
-		AddSem(v, "position", "attack position", 0x01, 0, 0, 0, 1);
-		AddSem(v, "position", "defense position", 0x02, 0, 0, 0, 1);
-		break;
-	case MSG_SELECT_PLACE:
-	case MSG_SELECT_DISFIELD: {
-		int i = 0;
-		// Base ("variant 0") bytes: ctrl==0 -> our seat, ctrl==1 -> opponent seat.  The exact
-		// convention is not worth guessing: EncodeSemAction() tries 4 variants (p / 1-p and
-		// MZONE/SZONE) and OnMessageBegin() advances the variant on every MSG_RETRY, so the
-		// first accepted combination wins within one prompt.
-		const int mySeat = SelfSeat();
-		for (const auto& pl : s.places) {
-			const int realCtrl = g_placeCoordsServer ? (pl.ctrl == 0 ? mySeat : 1 - mySeat) : pl.ctrl;
-			snprintf(buf, sizeof buf, "place bit=%d mask=%d ctrl=%d p0=%d seat=%d first=%d loc=%d seq=%d",
-				pl.bit, pl.ctrl, realCtrl, realCtrl, mySeat, (int)s.isFirst, pl.loc, pl.seq);
-			AddSem(v, "place", buf, i, realCtrl, pl.loc, pl.seq, 1);
-			++i;
-		}
-		break;
-	}
-	case MSG_SELECT_SUM:
-		AddSem(v, "sum", "auto-select materials", 0, 0, 0, 0, 1);
-		break;
-	case MSG_SELECT_COUNTER:
-		AddSem(v, "counter", "auto-place counters", 0, 0, 0, 0, 1);
-		break;
-	case MSG_SORT_CARD:
-		AddSem(v, "sort", "keep current order", 0, 0, 0, 0, 1);
-		break;
-	case MSG_ANNOUNCE_RACE:
-	case MSG_ANNOUNCE_ATTRIB:
-	case MSG_ANNOUNCE_NUMBER:
-	case MSG_ANNOUNCE_CARD:
-		AddSem(v, "announce", "auto announce (first option)", 0, 0, 0, 0, 1);
-		break;
-	default:
-		AddSem(v, "auto", "auto / safe default", 0, 0, 0, 0, 1);
-		break;
-	}
-	return v;
-}
-
-static bool EncodeSemAction(const Snapshot& s, const SemAction& a, int32_t& outI, std::vector<unsigned char>& outB, std::string& err) {
-	switch (s.curMsg) {
-	case MSG_SELECT_IDLECMD: {
-		int cmd = -1;
-		if (a.kind == "summon") cmd = 0;
-		else if (a.kind == "spsummon") cmd = 1;
-		else if (a.kind == "set_monster") cmd = 3;
-		else if (a.kind == "set_spell") cmd = 4;
-		else if (a.kind == "activate") cmd = 5;
-		else if (a.kind == "to_bp") cmd = 6;
-		else if (a.kind == "to_ep") cmd = 7;
-		if (cmd < 0) { err = "unknown idle action"; return false; }
-		outI = (a.index << 16) | cmd;
-		return true;
-	}
-	case MSG_SELECT_BATTLECMD: {
-		int cmd = -1;
-		if (a.kind == "attack") cmd = 1;
-		else if (a.kind == "to_m2") cmd = 2;
-		else if (a.kind == "end_battle") cmd = 3;
-		if (cmd < 0) { err = "unknown battle action"; return false; }
-		outI = (a.index << 16) | cmd;
-		return true;
-	}
-	case MSG_SELECT_CHAIN:
-		if (a.kind == "chain") { outI = a.index; return true; }
-		if (a.kind == "decline") { outI = -1; return true; }
-		err = "unknown chain action";
-		return false;
-	case MSG_SELECT_YESNO:
-	case MSG_SELECT_EFFECTYN:
-		if (a.kind == "yes") { outI = 1; return true; }
-		if (a.kind == "no") { outI = 0; return true; }
-		err = "unknown yes/no action";
-		return false;
-	case MSG_SELECT_OPTION:
-		if (a.kind != "option") { err = "unknown option action"; return false; }
-		outI = a.index;
-		return true;
-	case MSG_SELECT_POSITION:
-		if (a.kind != "position") { err = "unknown position action"; return false; }
-		outI = a.index & 0xff;
-		return true;
-	case MSG_SELECT_PLACE:
-	case MSG_SELECT_DISFIELD:
-		if (a.kind != "place") { err = "unknown place action"; return false; }
-		{
-			// v0 = base bytes from BuildSemActions, then try the 4 combinations that cover
-			// both p conventions (seat / flipped) and both loc conventions (MZONE/SZONE swapped).
-			const int v = g_placeVariant.load() & 3;
-			int p = a.ctrl;
-			int l = a.loc;
-			const int sq = a.seq;
-			if (v & 1) p = 1 - p;
-			if (v & 2) l = (l == LOCATION_MZONE) ? LOCATION_SZONE : LOCATION_MZONE;
-			const int bit = (a.index >= 0 && a.index < (int)s.places.size()) ? s.places[a.index].bit : -1;
-			Control::Log("PLACE resp variant=%d mask=0x%08x bit=%d -> (p=%d,l=%d,s=%d) count=%d first=%d hex=%02x%02x%02x",
-				v, s.selectableFieldMask, bit, p, l, sq, s.selectMin, (int)s.isFirst,
-				(unsigned char)p, (unsigned char)l, (unsigned char)sq);
-			outB.clear();
-			outB.push_back((unsigned char)p);
-			outB.push_back((unsigned char)l);
-			outB.push_back((unsigned char)sq);
-		}
-		return true;
-	case MSG_SELECT_CARD:
-	case MSG_SELECT_TRIBUTE:
-	case MSG_SELECT_UNSELECT_CARD: {
-		int n = s.selectMin > 0 ? s.selectMin : 1;
-		if ((int)s.selectableList.size() < n) n = (int)s.selectableList.size();
-		if (n <= 0) { err = "no selectable cards"; return false; }
-		outB.clear();
-		outB.push_back((unsigned char)n);
-		for (int i = 0; i < n; ++i) outB.push_back((unsigned char)s.selectableList[i].seqNo);
-		return true;
-	}
-	case MSG_SELECT_SUM: {
-		std::vector<std::pair<int, size_t>> items;
-		for (size_t i = 0; i < s.selectableList.size(); ++i)
-			items.push_back(std::make_pair((int)(s.selectableList[i].opParam & 0xffff), i));
-		std::sort(items.begin(), items.end(), [](const std::pair<int, size_t>& x, const std::pair<int, size_t>& y) { return x.first > y.first; });
-		std::vector<size_t> chosen;
-		long long sum = 0;
-		const int maxN = s.selectMax > 0 ? s.selectMax : (int)items.size();
-		for (size_t k = 0; k < items.size(); ++k) {
-			if ((int)chosen.size() >= maxN) break;
-			chosen.push_back(items[k].second);
-			sum += items[k].first;
-			if (s.sumMode == 0 ? sum == s.sumTarget : sum >= s.sumTarget) break;
-		}
-		if (chosen.empty()) { err = "cannot satisfy sum"; return false; }
-		outB.clear();
-		outB.push_back((unsigned char)chosen.size());
-		for (size_t k = 0; k < chosen.size(); ++k) outB.push_back((unsigned char)s.selectableList[chosen[k]].seqNo);
-		return true;
-	}
-	default:
-		// generic safe default so the semantic API can act on prompts it does not model yet
-		if (a.kind == "auto" || a.kind == "counter" || a.kind == "sort" || a.kind == "announce") {
-			if (s.selectMin > 0 && !s.selectableList.empty()) {
-				int n = s.selectMin;
-				if ((int)s.selectableList.size() < n) n = (int)s.selectableList.size();
-				outB.clear();
-				outB.push_back((unsigned char)n);
-				for (int i = 0; i < n; ++i) outB.push_back((unsigned char)s.selectableList[i].seqNo);
-				return true;
-			}
-			outI = 0;
-			return true;
-		}
-		err = "prompt type not supported";
-		return false;
-	}
-}
-
-static std::string SemActionsJson(const Snapshot& s) {
-	std::vector<SemAction> acts = BuildSemActions(s);
-	std::ostringstream os;
-	os << "{\"seq\":" << g_seq << ",\"curMsg\":" << s.curMsg << ",\"awaiting\":" << (g_awaiting ? "true" : "false") << ",\"actions\":[";
-	for (size_t i = 0; i < acts.size(); ++i) {
-		if (i) os << ',';
-		os << "{\"id\":" << i << ",\"kind\":\"" << acts[i].kind << "\",\"label\":\"";
-		for (size_t k = 0; k < acts[i].label.size(); ++k) {
-			char ch = acts[i].label[k];
-			if (ch == '"' || ch == '\\') os << '\\' << ch;
-			else os << ch;
-		}
-		os << "\"}";
-	}
-	os << "]}";
-	return os.str();
-}
-
 void HandleClient(SOCKET sock) {
 	char buf[8192];
 	int n = recv(sock, buf, sizeof(buf) - 1, 0);
@@ -728,6 +409,32 @@ void HandleClient(SOCKET sock) {
 			path = target.substr(0, q);
 			if (q != std::string::npos) query = target.substr(q + 1);
 		}
+		body = RouteRequest(path, query, status);
+	}
+	std::ostringstream resp;
+	resp << "HTTP/1.1 " << status << "\r\n"
+	     << "Content-Type: application/json; charset=utf-8\r\n"
+	     << "Content-Length: " << body.size() << "\r\n"
+	     << "Connection: close\r\n\r\n"
+	     << body;
+	std::string out = resp.str();
+	send(sock, out.c_str(), (int)out.size(), 0);
+#ifdef _WIN32
+	closesocket(sock);
+#else
+	close(sock);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// RouteRequest: the HTTP endpoint table that used to be inlined inside
+// HandleClient.  The two error paths previously used cross-scope `goto`s that
+// jumped out of a lock_guard scope to reach the response writer; they are now
+// plain `return body;`.  The lock_guard destructor still releases g_mutex before
+// the caller writes the response, but nothing relies on goto scoping any more.
+// ---------------------------------------------------------------------------
+std::string RouteRequest(const std::string& path, const std::string& query, std::string& status) {
+	std::string body;
 		if (path == "/health") {
 			body = g_started.load() ? "{\"ok\":true,\"started\":true}" : "{\"ok\":true,\"started\":false}";
 		} else if (path == "/state") {
@@ -793,9 +500,9 @@ void HandleClient(SOCKET sock) {
 			bool ok = false;
 			{
 				std::lock_guard<std::mutex> lk(g_mutex);
-				if (!g_awaiting) { body = "{\"ok\":false,\"error\":\"not awaiting\"}"; goto send_body; }
+				if (!g_awaiting) { body = "{\"ok\":false,\"error\":\"not awaiting\"}"; return body; }
 				auto acts = BuildSemActions(g_shared);
-				if (id < 0 || id >= (int)acts.size()) { body = "{\"ok\":false,\"error\":\"bad action id\"}"; goto send_body; }
+				if (id < 0 || id >= (int)acts.size()) { body = "{\"ok\":false,\"error\":\"bad action id\"}"; return body; }
 				ok = EncodeSemAction(g_shared, acts[id], ival, bytes, err);
 				if (ok) {
 					act.i = ival;
@@ -817,7 +524,6 @@ void HandleClient(SOCKET sock) {
 			}
 			if (!ok) { body = "{\"ok\":false,\"error\":\"" + err + "\"}"; }
 			else { body = "{\"ok\":true,\"queued\":true}"; }
-		send_body:;
 		} else if (path == "/wait_prompt") {
 			uint64_t since = (uint64_t)atoll(QueryParam(query, "since").c_str());
 			int timeout = atoi(QueryParam(query, "timeout_ms").c_str());
@@ -909,11 +615,11 @@ void HandleClient(SOCKET sock) {
 					std::lock_guard<std::mutex> lk(g_mutex);
 					if (seq != 0 && seq != g_seq) {
 						body = "{\"ok\":false,\"error\":\"stale seq\",\"seq\":" + std::to_string((long long)g_seq) + "}";
-						goto respond;
+						return body;
 					}
 					if (!g_awaiting) {
 						body = "{\"ok\":false,\"error\":\"not awaiting\"}";
-						goto respond;
+						return body;
 					}
 					g_awaiting = false;
 					g_actions.push_back(std::move(a));
@@ -979,22 +685,9 @@ void HandleClient(SOCKET sock) {
 			status = "404 Not Found";
 			body = "{\"ok\":false,\"error\":\"not found\"}";
 		}
-	}
-respond:
-	std::ostringstream resp;
-	resp << "HTTP/1.1 " << status << "\r\n"
-	     << "Content-Type: application/json; charset=utf-8\r\n"
-	     << "Content-Length: " << body.size() << "\r\n"
-	     << "Connection: close\r\n\r\n"
-	     << body;
-	std::string out = resp.str();
-	send(sock, out.c_str(), (int)out.size(), 0);
-#ifdef _WIN32
-	closesocket(sock);
-#else
-	close(sock);
-#endif
+	return body;
 }
+
 
 void ServerLoop(int port) {
 #ifdef _WIN32

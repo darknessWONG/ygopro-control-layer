@@ -197,6 +197,15 @@ struct Snapshot {
 	std::string lastMsgHex;
 };
 
+// control_sem.cpp: one semantic action offered to the LLM for the current prompt.
+struct SemAction {
+	std::string kind;
+	std::string label;
+	int index{ 0 };
+	int ctrl{ 0 }, loc{ 0 }, seq{ 0 };
+	int count{ 1 };
+};
+
 enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu };
 struct Action {
 	ActionKind kind{ ActionKind::None };
@@ -343,6 +352,14 @@ void LogVisibleWindows();
 
 // control_lobby.cpp
 bool ExecLobbyAction(const Action& a);
+
+// control_sem.cpp
+std::vector<SemAction> BuildSemActions(const Snapshot& s);
+bool EncodeSemAction(const Snapshot& s, const SemAction& a, int32_t& outI, std::vector<unsigned char>& outB, std::string& err);
+std::string SemActionsJson(const Snapshot& s);
+
+// control.cpp
+std::string RouteRequest(const std::string& path, const std::string& query, std::string& status);
 
 } // namespace ctl
 } // namespace ygo
