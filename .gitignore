@@ -45,6 +45,7 @@
 
 # build artifacts / local downloads (refactor baseline)
 /buildtmp/
+/buildtmp_out/
 /sqlite.zip
 *.obj
 *.pdb
