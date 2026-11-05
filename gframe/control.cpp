@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "control.h"
+#include "control_internal.h"
 #include "game.h"
 #include "client_field.h"
 #include "materials.h"
@@ -55,7 +56,7 @@
 
 namespace ygo {
 
-namespace {
+namespace ctl {
 
 constexpr int kDefaultPort = 7788;
 
@@ -71,159 +72,6 @@ bool IsPromptMsg(int id) {
 	return false;
 }
 
-struct CardSnap {
-	unsigned code{ 0 };
-	int attack{ 0 };
-	int defense{ 0 };
-	int position{ 0 };
-	int location{ 0 };
-	int sequence{ 0 };
-	bool faceup{ false };
-	bool hidden{ false };
-	unsigned type{ 0 };
-	unsigned level{ 0 };
-	std::string name;
-};
-
-struct CandSnap {
-	unsigned code{ 0 };
-	int atk{ 0 };
-	int def{ 0 };
-	int loc{ 0 };
-	int seq{ 0 };
-	int desc{ 0 };
-	int ctrl{ 0 };
-	bool forced{ false };
-	unsigned seqNo{ 0 };
-	unsigned opParam{ 0 };
-	unsigned level{ 0 };
-	unsigned rank{ 0 };
-	unsigned type{ 0 };
-};
-
-// task-19: chain semantics exposed to the MCP/LLM
-struct ChainLinkSnap {
-	int link{ 0 };            // 1-based chain link number
-	unsigned code{ 0 };
-	std::string name;
-	int desc{ 0 };
-	std::string descText;
-	int ctrl{ 0 }, loc{ 0 }, seq{ 0 };
-	bool forced{ false };
-	bool isMine{ false };
-	bool solved{ false };
-	std::string summary;
-};
-struct ChainCandSnap {
-	int index{ 0 };           // response index for MSG_SELECT_CHAIN
-	unsigned code{ 0 };
-	std::string name;
-	int desc{ 0 };
-	std::string descText;
-	bool forced{ false };
-	bool isMine{ false };
-	int ctrl{ 0 }, loc{ 0 }, seq{ 0 };
-	std::string summary;
-};
-
-// task-22: one visible window probe for /ui diagnostics
-struct WinSnap {
-	std::string name;
-	bool visible{ false };
-	int x{ 0 }, y{ 0 }, w{ 0 }, h{ 0 };
-	int l{ 0 }, t{ 0 }, r{ 0 }, b{ 0 };
-	int textLen{ -1 };
-	std::string text;
-};
-
-struct Snapshot {
-	bool valid{ false };
-	bool inDuel{ false };
-	bool started{ false };
-	int turn{ 0 };
-	int lp0{ 0 };
-	int lp1{ 0 };
-	int phase{ -1 };
-	int curMsg{ 0 };
-	int myPlayer{ 0 };
-	int mySeat{ 0 };
-	std::vector<CardSnap> hand[2];
-	std::vector<CardSnap> monsters[2];
-	std::vector<CardSnap> spells[2];
-	int graveCount[2]{ 0, 0 };
-	int removeCount[2]{ 0, 0 };
-	int deckCount[2]{ 0, 0 };
-	int extraCount[2]{ 0, 0 };
-	int summonable{ 0 };
-	int spsummonable{ 0 };
-	int msetable{ 0 };
-	int ssetable{ 0 };
-	int reposable{ 0 };
-	int activatable{ 0 };
-	int attackable{ 0 };
-	int chainCount{ 0 };
-	bool chainForced{ false };
-	bool lastChain{ false };
-	bool canBp{ false };
-	bool canEp{ false };
-	int selectMin{ 0 };
-	int selectMax{ 0 };
-	bool selectCancelable{ false };
-	int selectableCount{ 0 };
-	int sumTarget{ 0 };
-	int sumMode{ 0 };
-	struct PlaceSnap { int ctrl; int loc; int seq; int bit; };
-	std::vector<PlaceSnap> places;
-	unsigned selectableFieldMask{ 0 };  // raw f.selectable_field (already ~flag [+ swap] by the client)
-	bool isFirst{ false };              // dInfo.isFirst: used to undo the client's place-mask swap
-	// UI / chain-mode diagnostics (see bridge/docs/ui-fix.md)
-	int chainMode{ 1 };                 // applied mode: 0=all, 1=avail, 2=ignore
-	bool alwaysChain{ false };
-	bool chainWhenAvail{ true };
-	bool ignoreChain{ false };
-	unsigned popupMask{ 0 };            // bit0 wPosSelect, 1 wOptions, 2 wCardSelect, 3 wCmdMenu, 4 wMessage
-	unsigned uiCleanupCount{ 0 };
-	std::vector<CandSnap> summonableList, spsummonableList, msetableList, ssetableList, activatableList, attackableList, selectableList, chainList;
-	std::vector<int> options;
-	int lastMsgId{ 0 };
-	std::vector<CardSnap> grave[2];
-	std::vector<CardSnap> banished[2];
-	std::vector<CardSnap> extraDeck;   // our own extra deck (face-down to the opponent)
-	std::vector<CandSnap> contiList;   // continuous effects currently applying
-	std::vector<CandSnap> chainStackSnap;
-	// task-19 chain semantics
-	std::vector<ChainLinkSnap> chainStackFull;     // chain links (f.chains), in order
-	std::vector<ChainCandSnap> chainCandidates;    // choosable chains for the current MSG_SELECT_CHAIN
-	int chainDepth{ 0 };
-	bool canDecline{ true };
-	std::string chainHint;
-	std::string lastChainEvent;
-	std::string chainingToSummary;
-	std::vector<std::string> activeEffectLines;    // readable view of chainStack (empty when no chain)
-	// task-22: window diagnostics (visible popups + rect + text length)
-	std::vector<WinSnap> windows;
-	int timeLeft{ -1 };
-	size_t lastMsgLen{ 0 };
-	std::string lastMsgHex;
-};
-
-enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu };
-struct Action {
-	ActionKind kind{ ActionKind::None };
-	int32_t i{ 0 };
-	std::vector<unsigned char> bytes;
-	std::string ip;
-	int port{ 0 };
-	std::string pass;
-	std::string deckName;
-	// task-18: UI-driven execution carries the semantic identity of the chosen action
-	std::string semKind;      // "yes"/"no"/"position"/"chain"/"activate"/...
-	int semIndex{ 0 };        // index inside the prompt's candidate list
-	int semCtrl{ -1 };
-	int semLoc{ -1 };
-	int semSeq{ -1 };
-	int retries{ 0 };         // UiMenu two-phase retry counter (menu rendering can lag 1-2 frames)
-};
 
 std::mutex g_mutex;
 std::condition_variable g_cv;
@@ -323,17 +171,6 @@ bool g_hideExtra{ true };                 // env YGO_UI_HIDE_EXTRA=0 disables
 bool g_task22{ true };                    // env YGO_UI_TASK22=0 disables every task-22 path (A/B)
 bool g_closeEmpty{ true };                // env YGO_UI_CLOSE_EMPTY=0 disables only CloseEmptyFrames
 
-// task-18: after a UI-driven action, verify that the client really sent a response; otherwise
-// fall back to the direct path after ~300ms so a missed click can never deadlock the duel.
-struct UiPendingVerify {
-	bool active{ false };
-	uint64_t start{ 0 };
-	uint64_t ctosBefore{ 0 };
-	uint64_t analyzeBefore{ 0 };
-	int32_t fbI{ 0 };
-	std::vector<unsigned char> fbBytes;
-	std::string kind;
-};
 UiPendingVerify g_uiPending;
 
 /** short hex dump for responses: "response: prompt=16 kind=int val=-1 hex=ffffffff" */
@@ -349,103 +186,8 @@ static std::string HexBytes(const unsigned char* p, size_t n) {
 }
 
 /** wchar_t* (client text) -> UTF-8 for JSON */
-static std::string WideToUtf8(const wchar_t* w) {
-	if (!w || !*w) return {};
-#ifdef _WIN32
-	const int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-	if (need <= 1) return {};
-	std::string s;
-	s.resize(need - 1);
-	WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], need, nullptr, nullptr);
-	return s;
-#else
-	std::string s;
-	for (; *w; ++w) {
-		uint32_t cp = (uint32_t)*w;
-		if (cp < 0x80) s.push_back((char)cp);
-		else if (cp < 0x800) {
-			s.push_back((char)(0xC0 | (cp >> 6)));
-			s.push_back((char)(0x80 | (cp & 0x3F)));
-		} else {
-			s.push_back((char)(0xE0 | (cp >> 12)));
-			s.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
-			s.push_back((char)(0x80 | (cp & 0x3F)));
-		}
-	}
-	return s;
-#endif
-}
-static std::string CardNameOf(unsigned code) { return WideToUtf8(dataManager.GetName(code)); }
-static std::string DescTextOf(int desc) { return desc > 0 ? WideToUtf8(dataManager.GetDesc(desc)) : std::string(); }
 
-/** minimal JSON string escaping */
-static std::string JsonEscape(const std::string& s) {
-	std::string o;
-	o.reserve(s.size() + 8);
-	for (unsigned char c : s) {
-		switch (c) {
-		case '"': o += "\\\""; break;
-		case '\\': o += "\\\\"; break;
-		case '\n': o += "\\n"; break;
-		case '\r': o += "\\r"; break;
-		case '\t': o += "\\t"; break;
-		default:
-			if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
-			else o.push_back((char)c);
-		}
-	}
-	return o;
-}
-static std::string CardLabel(unsigned code, const std::string& name) {
-	return name.empty() ? ("code=" + std::to_string(code)) : name;
-}
-
-/** task-19: append chain semantics (identical fields in /prompt and /state) */
-static void AppendChainJson(std::ostringstream& os, const Snapshot& s) {
-	os << ",\"chainDepth\":" << s.chainDepth;
-	os << ",\"chainStack\":[";
-	for (size_t i = 0; i < s.chainStackFull.size(); ++i) {
-		if (i) os << ',';
-		const auto& c = s.chainStackFull[i];
-		os << "{\"link\":" << c.link << ",\"code\":" << c.code
-		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
-		   << ",\"desc\":" << c.desc << ",\"descText\":\"" << JsonEscape(c.descText) << '"'
-		   << ",\"ctrl\":" << c.ctrl << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq
-		   << ",\"type\":\"effect\",\"forced\":" << (c.forced ? "true" : "false")
-		   << ",\"isMine\":" << (c.isMine ? "true" : "false")
-		   << ",\"solved\":" << (c.solved ? "true" : "false")
-		   << ",\"summary\":\"" << JsonEscape(c.summary) << "\"}";
-	}
-	os << "]";
-	os << ",\"chainingTo\":";
-	if (s.chainStackFull.empty()) {
-		os << "null";
-	} else {
-		const auto& c = s.chainStackFull.back();
-		os << "{\"link\":" << c.link << ",\"code\":" << c.code
-		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
-		   << ",\"descText\":\"" << JsonEscape(c.descText) << '"'
-		   << ",\"summary\":\"" << JsonEscape(s.chainingToSummary) << "\"}";
-	}
-	os << ",\"chainCandidates\":[";
-	for (size_t i = 0; i < s.chainCandidates.size(); ++i) {
-		if (i) os << ',';
-		const auto& c = s.chainCandidates[i];
-		os << "{\"index\":" << c.index << ",\"code\":" << c.code
-		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
-		   << ",\"desc\":" << c.desc << ",\"descText\":\"" << JsonEscape(c.descText) << '"'
-		   << ",\"forced\":" << (c.forced ? "true" : "false")
-		   << ",\"isMine\":" << (c.isMine ? "true" : "false")
-		   << ",\"ctrl\":" << c.ctrl << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq
-		   << ",\"summary\":\"" << JsonEscape(c.summary) << "\"}";
-	}
-	os << "]";
-	os << ",\"canDecline\":" << (s.canDecline ? "true" : "false")
-	   << ",\"hint\":\"" << JsonEscape(s.chainHint) << '"'
-	   << ",\"lastChainEvent\":\"" << JsonEscape(s.lastChainEvent) << '"';
-}
-
-static const char* StocName(int id) {
+const char* StocName(int id) {
 	switch (id) {
 	case 0x01: return "STOC_GAME_MSG";
 	case 0x02: return "STOC_ERROR_MSG";
@@ -472,7 +214,7 @@ static const char* StocName(int id) {
 // plus Lua Duel.Win(player, reason) (libduel.cpp) whose `reason` is the WIN_REASON_*
 // constant from the card scripts.  Names below come from CardScripts/constant.lua
 // (WIN_REASON_*) and the matching Chinese text from strings.conf (!victory <id>).
-static const char* WinReasonName(int reason) {
+const char* WinReasonName(int reason) {
 	switch (reason) {
 	case 0x00: return "SURRENDER";             // strings.conf !victory 0x0 投降
 	case 0x01: return "LP_ZERO";               // 0x1 基本分变成0  (core rea=1)
@@ -509,7 +251,7 @@ static const char* WinReasonName(int reason) {
 	}
 }
 
-static long long SinceTickMs(const std::atomic<uint64_t>& tick, uint64_t now) {
+long long SinceTickMs(const std::atomic<uint64_t>& tick, uint64_t now) {
 	const uint64_t t = tick.load();
 	return t ? (long long)(now - t) : -1;
 }
@@ -562,7 +304,7 @@ static void AutoDismissPump() {
 	mainGame->actionSignal.Set();
 }
 
-static const char* ChainModeName(int m) {
+const char* ChainModeName(int m) {
 	return m == 0 ? "all" : (m == 2 ? "ignore" : "avail");
 }
 
@@ -627,7 +369,7 @@ static void UiCleanup(const char* why) {
 }
 
 /** current popup mask without hiding anything (bit order as UiCleanup); call from the UI thread */
-static unsigned PopupBits() {
+unsigned PopupBits() {
 	unsigned bits = 0;
 	if (mainGame->wPosSelect && mainGame->wPosSelect->isVisible()) bits |= 0x01;
 	if (mainGame->wOptions && mainGame->wOptions->isVisible()) bits |= 0x02;
@@ -646,7 +388,7 @@ static std::wstring TextOfWidget(irr::gui::IGUIElement* el) {
 	const wchar_t* t = el->getText();
 	return t ? std::wstring(t) : std::wstring();
 }
-static std::vector<WinSnap> CollectWindows() {
+std::vector<WinSnap> CollectWindows() {
 	std::vector<WinSnap> out;
 	auto add = [&out](const char* name, irr::gui::IGUIWindow* win, irr::gui::IGUIStaticText* textEl, bool wantText) {
 		if (!win) return;
@@ -991,7 +733,7 @@ static bool TryUiSemantic(const Action& a) {
 	}
 	return false;
 }
-static void CtlDbg(const char* fmt, ...) {
+void CtlDbg(const char* fmt, ...) {
 	static const bool on = std::getenv("YGO_CTRL_DEBUG") != nullptr;
 	if (!on) return;
 	char buf[512];
@@ -1085,38 +827,6 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
 }
 std::atomic<bool> g_started{ false };
 
-void FillCard(std::vector<CardSnap>& out, ClientCard* c, int owner, int myPlayer) {
-	if (!c) return;
-	CardSnap s;
-	s.faceup = (c->position & POS_FACEUP) != 0;
-	s.hidden = (owner != myPlayer) && !s.faceup;
-	s.code = s.hidden ? 0 : c->code;
-	s.attack = c->attack;
-	s.defense = c->defense;
-	s.position = c->position;
-	s.location = c->location;
-	s.sequence = c->sequence;
-	if (!s.hidden) {
-		const CardDataC* cd = nullptr;
-		auto it = dataManager.GetCodePointer(c->code);
-		if (it != dataManager.GetDataTable().end()) cd = &it->second;
-		if (cd) { s.type = cd->type; s.level = cd->level; if (!s.attack) s.attack = cd->attack; if (!s.defense) s.defense = cd->defense; }
-		const wchar_t* nm = dataManager.GetName(c->code);
-		if (nm && *nm) { char buf[256]{}; int n = WideCharToMultiByte(CP_UTF8, 0, nm, -1, buf, (int)sizeof(buf) - 1, nullptr, nullptr); if (n > 0) s.name.assign(buf); }
-	}
-	out.push_back(s);
-}
-
-std::string Hex(const unsigned char* p, size_t n) {
-	static const char* d = "0123456789abcdef";
-	std::string s;
-	s.reserve(n * 2);
-	for (size_t i = 0; i < n; ++i) {
-		s.push_back(d[p[i] >> 4]);
-		s.push_back(d[p[i] & 0xF]);
-	}
-	return s;
-}
 
 std::vector<unsigned char> Unhex(const std::string& s) {
 	std::vector<unsigned char> out;
@@ -1134,535 +844,6 @@ std::vector<unsigned char> Unhex(const std::string& s) {
 	return out;
 }
 
-void AppendCard(std::ostringstream& os, const CardSnap& c) {
-	os << "{\"code\":" << c.code << ",\"atk\":" << c.attack << ",\"def\":" << c.defense
-	   << ",\"pos\":" << c.position << ",\"faceup\":" << (c.faceup ? "true" : "false")
-	   << ",\"hidden\":" << (c.hidden ? "true" : "false")
-	   << ",\"ty\":" << c.type << ",\"lv\":" << c.level << ",\"name\":\"";
-	for (size_t k = 0; k < c.name.size(); ++k) { char ch = c.name[k]; if (ch == 34 || ch == 92) os << 92 << ch; else os << ch; }
-	os << "\"";
-	os << ",\"loc\":" << c.location << ",\"seq\":" << c.sequence << "}";
-}
-
-void AppendCards(std::ostringstream& os, const std::vector<CardSnap>& v) {
-	os << '[';
-	for (size_t i = 0; i < v.size(); ++i) {
-		if (i) os << ',';
-		AppendCard(os, v[i]);
-	}
-	os << ']';
-}
-
-void AppendCands(std::ostringstream& os, const std::vector<CandSnap>& v) {
-	os << '[';
-	for (size_t i = 0; i < v.size(); ++i) {
-		if (i) os << ',';
-		const auto& c = v[i];
-		os << "{\"i\":" << i << ",\"code\":" << c.code << ",\"atk\":" << c.atk << ",\"def\":" << c.def
-		   << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq << ",\"seqNo\":" << c.seqNo << ",\"op\":" << c.opParam << ",\"lv\":" << c.level << ",\"rk\":" << c.rank << ",\"ty\":" << c.type << ",\"desc\":" << c.desc
-		   << ",\"ctrl\":" << c.ctrl << ",\"forced\":" << (c.forced ? "true" : "false") << '}';
-	}
-	os << ']';
-}
-
-std::string PromptJson(const Snapshot& s) {
-	std::ostringstream os;
-	os << "{\"seq\":" << g_seq << ",\"curMsg\":" << s.curMsg << ",\"turn\":" << s.turn
-	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false")
-	   << ",\"summonable\":" << s.summonable
-	   << ",\"spsummonable\":" << s.spsummonable
-	   << ",\"msetable\":" << s.msetable
-	   << ",\"ssetable\":" << s.ssetable
-	   << ",\"reposable\":" << s.reposable
-	   << ",\"activatable\":" << s.activatable
-	   << ",\"attackable\":" << s.attackable
-	   << ",\"chains\":" << s.chainCount
-	   << ",\"chainForced\":" << (s.chainForced ? "true" : "false")
-	   << ",\"lastChain\":" << (s.lastChain ? "true" : "false")
-	   << ",\"selectMin\":" << s.selectMin
-	   << ",\"selectMax\":" << s.selectMax
-	   << ",\"selectCancelable\":" << (s.selectCancelable ? "true" : "false")
-	   << ",\"selectableCount\":" << s.selectableCount
-	   << ",\"canBp\":" << (s.canBp ? "true" : "false")
-	   << ",\"canEp\":" << (s.canEp ? "true" : "false")
-	   << ",\"summonableCards\":";
-	AppendCands(os, s.summonableList);
-	os << ",\"spsummonableCards\":";
-	AppendCands(os, s.spsummonableList);
-	os << ",\"msetableCards\":";
-	AppendCands(os, s.msetableList);
-	os << ",\"ssetableCards\":";
-	AppendCands(os, s.ssetableList);
-	os << ",\"activatableCards\":";
-	AppendCands(os, s.activatableList);
-	os << ",\"attackableCards\":";
-	AppendCands(os, s.attackableList);
-	os << ",\"selectableCards\":";
-	AppendCands(os, s.selectableList);
-	os << ",\"chains\":";
-	AppendCands(os, s.chainList);
-	os << ",\"places\":[";
-	for (size_t i = 0; i < s.places.size(); ++i) {
-		if (i) os << ',';
-		os << "{\"i\":" << i << ",\"ctrl\":" << s.places[i].ctrl << ",\"loc\":" << s.places[i].loc
-		   << ",\"seq\":" << s.places[i].seq << ",\"bit\":" << s.places[i].bit << '}';
-	}
-	os << "],\"placesMask\":" << s.selectableFieldMask
-	   << ",\"isFirst\":" << (s.isFirst ? "true" : "false")
-	   << ",\"placeCoords\":\"" << (g_placeCoordsServer ? "server" : "local") << '"';
-	os << ",\"sumTarget\":" << s.sumTarget << ",\"sumMode\":" << s.sumMode;
-	os << ",\"options\":[";
-	for (size_t i = 0; i < s.options.size(); ++i) { if (i) os << ','; os << s.options[i]; }
-	os << ']';
-	AppendChainJson(os, s);
-	os << '}';
-	return os.str();
-}
-
-static const char* PhaseName(int ph) {
-	switch (ph) {
-	case 0x01: return "DRAW";
-	case 0x02: return "STANDBY";
-	case 0x04: return "MAIN1";
-	case 0x08: return "BATTLE_START";
-	case 0x10: return "BATTLE_STEP";
-	case 0x20: return "DAMAGE";
-	case 0x40: return "DAMAGE_CAL";
-	case 0x80: return "BATTLE_END";
-	case 0x100: return "MAIN2";
-	case 0x200: return "END";
-	default: return "UNKNOWN";
-	}
-}
-
-/** /ui payload (flat, no "ok"): REAL chain mode + desired/applied + popup visibility */
-static std::string UiJson(const Snapshot& s) {
-	std::ostringstream os;
-	const int desired = g_chainMode.load();
-	const int applied = g_appliedChainMode.load();
-	os << "{\"chainMode\":" << s.chainMode                       // real mode derived from the widgets
-	   << ",\"chainModeName\":\"" << ChainModeName(s.chainMode) << '"'
-	   << ",\"alwaysChain\":" << (s.alwaysChain ? "true" : "false")
-	   << ",\"chainWhenAvail\":" << (s.chainWhenAvail ? "true" : "false")
-	   << ",\"ignoreChain\":" << (s.ignoreChain ? "true" : "false")
-	   << ",\"desiredChainMode\":" << desired
-	   << ",\"desiredChainModeName\":\"" << ChainModeName(desired) << '"'
-	   << ",\"appliedChainMode\":" << applied
-	   << ",\"applyPending\":" << (g_applyChainPending.load() ? "true" : "false")
-	   << ",\"uiCleanupCount\":" << s.uiCleanupCount
-	   << ",\"popupMask\":" << s.popupMask
-	   << ",\"popups\":{\"posSelect\":" << ((s.popupMask & 0x01) ? "true" : "false")
-	   << ",\"options\":" << ((s.popupMask & 0x02) ? "true" : "false")
-	   << ",\"cardSelect\":" << ((s.popupMask & 0x04) ? "true" : "false")
-	   << ",\"cmdMenu\":" << ((s.popupMask & 0x08) ? "true" : "false")
-	   << ",\"message\":" << ((s.popupMask & 0x10) ? "true" : "false")
-	   << "}";
-	// task-22: per-window diagnostics (visible + rect + text length)
-	os << ",\"windows\":[";
-	std::string visNames;
-	for (size_t i = 0; i < s.windows.size(); ++i) {
-		if (i) os << ',';
-		const auto& w = s.windows[i];
-		os << "{\"name\":\"" << w.name << "\",\"visible\":" << (w.visible ? "true" : "false")
-		   << ",\"rect\":{\"l\":" << w.l << ",\"t\":" << w.t << ",\"r\":" << w.r << ",\"b\":" << w.b << "}"
-		   << ",\"x\":" << w.x << ",\"y\":" << w.y << ",\"w\":" << w.w << ",\"h\":" << w.h
-		   << ",\"textLen\":" << w.textLen;
-		if (w.textLen > 0) os << ",\"text\":\"" << JsonEscape(w.text) << '"';
-		os << '}';
-		if (w.visible) {
-			if (!visNames.empty()) visNames += ',';
-			visNames += '"';
-			visNames += w.name;   // window names are fixed ASCII identifiers, no escaping needed
-			visNames += '"';
-		}
-	}
-	os << "]";
-	os << ",\"windowsVisible\":[" << visNames << "]";
-	os << '}';
-	return os.str();
-}
-
-std::string SnapshotJson(const Snapshot& s) {
-	std::ostringstream os;
-	os << "{\"valid\":" << (s.valid ? "true" : "false")
-	   << ",\"inDuel\":" << (s.inDuel ? "true" : "false")
-	   << ",\"started\":" << (s.started ? "true" : "false")
-	   << ",\"turn\":" << s.turn
-	   << ",\"lp\":[" << s.lp0 << ',' << s.lp1 << ']'
-	   << ",\"phase\":" << s.phase
-	   << ",\"curMsg\":" << s.curMsg
-	   << ",\"myPlayer\":" << s.myPlayer
-	   << ",\"mySeat\":" << s.mySeat
-	   << ",\"turnPlayer\":" << g_turnPlayer << ",\"isMyTurn\":" << (g_turnPlayer == s.myPlayer ? "true" : "false")
-	   << ",\"selftype\":" << (int)DuelClient::selftype
-	   << ",\"winPlayer\":" << g_winPlayer
-	   << ",\"winReason\":" << g_winReason
-	   << ",\"winReasonName\":\"" << WinReasonName(g_winReason) << '"'
-	   // UI / chain mode (see bridge/docs/ui-fix.md)
-	   << ",\"chainMode\":" << s.chainMode
-	   << ",\"uiCleanupCount\":" << s.uiCleanupCount
-	   << ",\"ui\":" << UiJson(s)
-	   // top-level aliases so bots do not have to dig into "pipeline"
-	   << ",\"retryCount\":" << (unsigned long long)g_retryCount.load()
-	   << ",\"lastRetryAfterMsg\":" << g_lastRetryAfterMsg.load()
-	   << ",\"retryStreak\":" << (unsigned long long)g_retryStreak.load()
-	   << ",\"placeVariant\":" << g_placeVariant.load()
-	   << ",\"playerType\":" << (int)mainGame->dInfo.player_type
-	   << ",\"deckMain\":" << g_deckMain
-	   << ",\"deckExtra\":" << g_deckExtra
-	   << ",\"seq\":" << g_seq
-	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false")
-	   << ",\"lastMsg\":{\"id\":" << s.lastMsgId << ",\"len\":" << s.lastMsgLen
-	   << ",\"hex\":\"" << s.lastMsgHex << "\"}";
-	os << ",\"counts\":{\"hand\":[" << s.hand[0].size() << ',' << s.hand[1].size() << ']'
-	   << ",\"grave\":[" << s.graveCount[0] << ',' << s.graveCount[1] << ']'
-	   << ",\"remove\":[" << s.removeCount[0] << ',' << s.removeCount[1] << ']'
-	   << ",\"deck\":[" << s.deckCount[0] << ',' << s.deckCount[1] << ']'
-	   << ",\"extra\":[" << s.extraCount[0] << ',' << s.extraCount[1] << "]}";
-	os << ",\"hand\":[";
-	AppendCards(os, s.hand[0]);
-	os << ',';
-	AppendCards(os, s.hand[1]);
-	os << ']';
-	os << ",\"monsters\":[";
-	AppendCards(os, s.monsters[0]);
-	os << ',';
-	AppendCards(os, s.monsters[1]);
-	os << ']';
-	os << ",\"spells\":[";
-	AppendCards(os, s.spells[0]);
-	os << ',';
-	AppendCards(os, s.spells[1]);
-	os << ']';
-	os << ",\"phaseName\":\"" << PhaseName(s.phase) << "\"";
-	os << ",\"timeLeft\":" << (g_timeLeft >= 0 ? g_timeLeft : s.timeLeft);
-	os << ",\"errorMsg\":" << g_errMsg << ",\"errorCode\":" << g_errCode;
-	os << ",\"grave\":[";
-	AppendCards(os, s.grave[0]); os << ","; AppendCards(os, s.grave[1]); os << "]";
-	os << ",\"banished\":[";
-	AppendCards(os, s.banished[0]); os << ","; AppendCards(os, s.banished[1]); os << "]";
-	os << ",\"extraDeck\":";
-	AppendCards(os, s.extraDeck);
-	// task-19: activeEffects = readable chain stack (empty once the chain ends / MSG_CHAIN_END)
-	os << ",\"activeEffects\":[";
-	for (size_t k = 0; k < s.activeEffectLines.size(); ++k) {
-		if (k) os << ',';
-		os << "\"" << JsonEscape(s.activeEffectLines[k]) << '"';
-	}
-	os << "]";
-	os << ",\"continuousEffects\":[";
-	for (size_t k = 0; k < s.contiList.size(); ++k) {
-		if (k) os << ",";
-		const auto& c = s.contiList[k];
-		os << "{\"code\":" << c.code << ",\"desc\":" << c.desc << ",\"ctrl\":" << c.ctrl << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq << ",\"lv\":" << c.level << ",\"ty\":" << c.type << "}";
-	}
-	os << "]";
-	AppendChainJson(os, s);
-	const uint64_t pipeNow = GetTickCount64();
-	os << ",\"pipeline\":{"
-	   << "\"analyzeCount\":" << (unsigned long long)g_analyzeCount.load()
-	   << ",\"pumpCount\":" << (unsigned long long)g_pumpCount.load()
-	   << ",\"msgCount\":" << (unsigned long long)g_gameMsgCount.load()
-	   << ",\"seq\":" << (unsigned long long)g_seq
-	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false")
-	   << ",\"lastStoc\":" << g_lastStocId.load()
-	   << ",\"lastStocName\":\"" << StocName(g_lastStocId.load()) << '"'
-	   << ",\"sinceLastAnalyzeMs\":" << SinceTickMs(g_lastAnalyzeTick, pipeNow)
-	   << ",\"sinceLastPumpMs\":" << SinceTickMs(g_lastPumpTick, pipeNow)
-	   << ",\"retryCount\":" << (unsigned long long)g_retryCount.load()
-	   << ",\"lastRetryAfterMsg\":" << g_lastRetryAfterMsg.load()
-	   << ",\"lastNonRetryMsg\":" << g_lastNonRetryMsgId.load()
-	   << ",\"retryStreak\":" << (unsigned long long)g_retryStreak.load()
-	   << ",\"placeVariant\":" << g_placeVariant.load()
-	   << ",\"autoDismiss\":" << (g_autoDismiss.load() ? "true" : "false")
-	   << ",\"dismissCount\":" << (unsigned long long)g_dismissCount.load()
-	   << '}';
-	os << ",\"prompt\":" << PromptJson(s);
-	os << '}';
-	return os.str();
-}
-
-static int LaunchSeat() {
-	// -c = create/host LAN room (seat 0), -j = join (seat 1). The server does not always tell us
-	// our seat before the duel starts, so remember how we were launched.
-	static int v = -2;
-	if (v == -2) {
-		v = -1;
-		const wchar_t* cl = GetCommandLineW();
-		if (cl) {
-			std::wstring s(cl);
-			if (s.find(L" -c") != std::wstring::npos || s.find(L" -c ") != std::wstring::npos) v = 0;
-			else if (s.find(L" -j") != std::wstring::npos) v = 1;
-		}
-	}
-	return v;
-}
-
-static int SelfSeat() {
-	const int s = (int)(DuelClient::selftype & 1);
-	const int l = LaunchSeat();
-	if (l >= 0 && s == 0 && l == 1) return 1; // guest: server has not sent our seat yet
-	return s;
-}
-void SnapshotFromClient(Snapshot& s) {
-	s = Snapshot();
-	s.lastMsgId = g_lastMsgId;
-	s.lastMsgLen = g_lastRawLen;
-	s.lastMsgHex = Hex(g_lastRaw, g_lastRawLen);
-	s.phase = g_phase;
-	if (!mainGame) return;
-	s.inDuel = mainGame->dInfo.isInDuel;
-	s.started = mainGame->dInfo.isStarted;
-	s.turn = mainGame->dInfo.turn;
-	s.lp0 = mainGame->dInfo.lp[0];
-	s.lp1 = mainGame->dInfo.lp[1];
-	s.curMsg = mainGame->dInfo.curMsg;
-	// dField is indexed from the LOCAL player perspective (0 = me, 1 = opponent) whatever our seat.
-	// Keep the real seat separately for lobby / seat-dependent encoding.
-	s.myPlayer = 0;
-	s.mySeat = (int)mainGame->dInfo.player_type;
-	auto& f = mainGame->dField;
-	for (int i = 0; i < 2; ++i) {
-		for (auto* c : f.hand[i]) FillCard(s.hand[i], c, i, s.myPlayer);
-		for (auto* c : f.mzone[i]) FillCard(s.monsters[i], c, i, s.myPlayer);
-		for (auto* c : f.szone[i]) FillCard(s.spells[i], c, i, s.myPlayer);
-		s.graveCount[i] = (int)f.grave[i].size();
-		s.removeCount[i] = (int)f.remove[i].size();
-		s.deckCount[i] = (int)f.deck[i].size();
-		s.extraCount[i] = (int)f.extra[i].size();
-		for (auto* c : f.grave[i]) FillCard(s.grave[i], c, i, s.myPlayer);
-		for (auto* c : f.remove[i]) FillCard(s.banished[i], c, i, s.myPlayer);
-		if (i == s.myPlayer) {
-			for (auto* c : f.extra[i]) FillCard(s.extraDeck, c, i, s.myPlayer);
-			// our own extra deck: the field pile has no codes until revealed, so use the loaded deck list
-			if (!g_sentExtra.empty()) {
-				s.extraDeck.clear();
-				for (unsigned code2 : g_sentExtra) {
-					CardSnap es;
-					es.code = code2;
-					es.type = 0;
-					es.level = 0;
-					es.attack = 0;
-					es.defense = 0;
-					es.location = 0x40;
-					{
-						auto it2 = dataManager.GetCodePointer(code2);
-						if (it2 != dataManager.GetDataTable().end()) { es.type = it2->second.type; es.level = it2->second.level; es.attack = it2->second.attack; es.defense = it2->second.defense; }
-					}
-					const wchar_t* nm = dataManager.GetName(code2);
-					if (nm && *nm) { char b[256]{}; if (WideCharToMultiByte(CP_UTF8, 0, nm, -1, b, (int)sizeof(b) - 1, nullptr, nullptr) > 0) es.name.assign(b); }
-					s.extraDeck.push_back(es);
-				}
-			}
-		}
-	}
-	s.summonable = (int)f.summonable_cards.size();
-	s.spsummonable = (int)f.spsummonable_cards.size();
-	s.msetable = (int)f.msetable_cards.size();
-	s.ssetable = (int)f.ssetable_cards.size();
-	s.reposable = (int)f.reposable_cards.size();
-	s.activatable = (int)f.activatable_cards.size();
-	s.attackable = (int)f.attackable_cards.size();
-	for (auto* c : f.conti_cards) {
-		if (!c) continue;
-		CandSnap cs; cs.code = c->code; cs.ctrl = c->controler; cs.loc = c->location; cs.seq = c->sequence;
-		cs.desc = c->cHint;
-		{ const CardDataC* cd = dataManager.GetCodePointer(c->code) == dataManager.GetDataTable().end() ? nullptr : &dataManager.GetCodePointer(c->code)->second;
-		  if (cd) { if (!cs.level) cs.level = cd->level; if (!cs.type) cs.type = cd->type; } }
-		s.contiList.push_back(cs);
-	}
-	for (const auto& ch : f.chains) {
-		CandSnap cs; cs.code = ch.code; cs.desc = ch.desc; cs.ctrl = ch.controler; cs.loc = ch.location; cs.seq = ch.sequence; cs.forced = ch.solved;
-		s.chainStackSnap.push_back(cs);
-	}
-	s.chainForced = f.chain_forced;
-	s.lastChain = f.last_chain;
-	s.canBp = mainGame->btnBP && mainGame->btnBP->isVisible();
-	s.canEp = mainGame->btnEP && mainGame->btnEP->isVisible();
-	s.selectMin = f.select_min;
-	s.selectMax = f.select_max;
-	s.selectCancelable = f.select_cancelable;
-	s.selectableCount = (int)f.selectable_cards.size();
-	s.sumTarget = f.select_sumval;
-	s.sumMode = f.select_mode;
-	auto addCard = [](std::vector<CandSnap>& out, ClientCard* pc) {
-		if (!pc) return;
-		CandSnap cs;
-		cs.code = pc->code;
-		cs.atk = pc->attack;
-		cs.def = pc->defense;
-		cs.loc = pc->location;
-		cs.seq = pc->sequence;
-		cs.seqNo = pc->select_seq;
-		cs.opParam = pc->opParam;
-		cs.level = pc->level;
-		cs.rank = pc->rank;
-		cs.type = pc->type;
-		// hand / extra-deck cards often carry no data yet: fill type/level/atk/def from cards.cdb
-		if (cs.level == 0 || cs.type == 0) {
-			auto it = dataManager.GetCodePointer(pc->code);
-			const CardDataC* cd = (it != dataManager.GetDataTable().end()) ? &it->second : nullptr;
-			if (cd) {
-				if (cs.type == 0) cs.type = cd->type;
-				if (cs.level == 0) cs.level = cd->level;
-				if (cs.atk == 0) cs.atk = cd->attack;
-				if (cs.def == 0) cs.def = cd->defense;
-			}
-		}
-		out.push_back(cs);
-	};
-	for (auto* pc : f.summonable_cards) addCard(s.summonableList, pc);
-	for (auto* pc : f.spsummonable_cards) addCard(s.spsummonableList, pc);
-	for (auto* pc : f.msetable_cards) addCard(s.msetableList, pc);
-	for (auto* pc : f.ssetable_cards) addCard(s.ssetableList, pc);
-	for (auto* pc : f.activatable_cards) addCard(s.activatableList, pc);
-	for (auto* pc : f.attackable_cards) addCard(s.attackableList, pc);
-	for (auto* pc : f.selectable_cards) addCard(s.selectableList, pc);
-	for (size_t i = 0; i < f.activatable_descs.size(); ++i) {
-		if (i < s.activatableList.size()) s.activatableList[i].desc = f.activatable_descs[i].first;
-	}
-	// MSG_SELECT_CHAIN's response is an index into the *message* chain list, which the client
-	// stores in activatable_cards / activatable_descs in message order (duelclient.cpp case
-	// MSG_SELECT_CHAIN).  f.chains is the on-field chain display list (it also contains earlier
-	// links), so indexing it produced illegal chain indexes -> server answered MSG_RETRY forever.
-	s.chainList.clear();
-	for (size_t i = 0; i < f.activatable_cards.size(); ++i) {
-		ClientCard* pc = f.activatable_cards[i];
-		if (!pc) continue;
-		CandSnap cs;
-		cs.code = pc->code;
-		cs.ctrl = pc->controler;
-		cs.loc = pc->location;
-		cs.seq = (int)i; // message order == response index
-		cs.seqNo = (unsigned)i;
-		if (i < f.activatable_descs.size()) {
-			cs.desc = f.activatable_descs[i].first;
-			// activatable_descs[i].second = flag, with forced stored in bit 8 (flag |= forced << 8)
-			cs.forced = (f.activatable_descs[i].second & 0x100) != 0;
-		}
-		s.chainList.push_back(cs);
-	}
-	s.chainCount = (int)s.chainList.size();
-	// ---- task-19: chain semantics (names / effect text / who chains whom / decide hints) ----
-	{
-		const int mySeat = SelfSeat();
-		std::string targetLabel;
-		if (!f.chains.empty()) {
-			const ChainInfo& lastLink = f.chains.back();
-			targetLabel = CardLabel((unsigned)lastLink.code, CardNameOf((unsigned)lastLink.code));
-		}
-		s.chainStackFull.clear();
-		for (size_t i = 0; i < f.chains.size(); ++i) {
-			const ChainInfo& ch = f.chains[i];
-			ChainLinkSnap ls;
-			ls.link = (int)i + 1;
-			ls.code = (unsigned)ch.code;
-			ls.name = CardNameOf(ls.code);
-			ls.desc = ch.desc;
-			// dField.chains may carry desc=0 (the display list is filled from MSG_CHAINED state);
-			// recover the effect description from the still-present candidate list / card hint.
-			if (ls.desc <= 0 && ch.chain_card) {
-				for (size_t k = 0; k < f.activatable_cards.size() && k < f.activatable_descs.size(); ++k) {
-					if (f.activatable_cards[k] == ch.chain_card) { ls.desc = f.activatable_descs[k].first; break; }
-				}
-				if (ls.desc <= 0 && ch.chain_card->cHint > 0) ls.desc = ch.chain_card->cHint;
-			}
-			ls.descText = DescTextOf(ls.desc);
-			if (ls.descText.empty()) ls.descText = ls.name.empty() ? "（未知效果）" : (ls.name + " 的效果");
-			ls.ctrl = ch.controler;
-			ls.loc = ch.location;
-			ls.seq = ch.sequence;
-			ls.isMine = (ch.controler == mySeat);
-			ls.solved = ch.solved;
-			ls.summary = std::string(ls.isMine ? "我方" : "对手") + "[" + CardLabel(ls.code, ls.name) + "]" +
-				(ls.descText.empty() ? "" : "（" + ls.descText + "）") + " 已加入连锁";
-			s.chainStackFull.push_back(std::move(ls));
-		}
-		s.chainDepth = (int)s.chainStackFull.size();
-		s.chainingToSummary.clear();
-		if (!s.chainStackFull.empty()) {
-			const ChainLinkSnap& last = s.chainStackFull.back();
-			s.chainingToSummary = std::string(last.isMine ? "我方" : "对手") + "[" + CardLabel(last.code, last.name) + "]" +
-				(last.descText.empty() ? "" : "（" + last.descText + "）");
-		}
-		// candidates: response index == position in activatable_cards / activatable_descs
-		s.chainCandidates.clear();
-		for (size_t i = 0; i < f.activatable_cards.size(); ++i) {
-			ClientCard* pc = f.activatable_cards[i];
-			if (!pc) continue;
-			ChainCandSnap cs;
-			cs.index = (int)i;
-			cs.code = pc->code;
-			cs.name = CardNameOf(cs.code);
-			if (i < f.activatable_descs.size()) cs.desc = f.activatable_descs[i].first;
-			cs.descText = DescTextOf(cs.desc);
-			if (cs.descText.empty()) cs.descText = cs.name.empty() ? "（未知效果）" : (cs.name + " 的效果");
-			cs.forced = (i < f.activatable_descs.size()) && (f.activatable_descs[i].second & 0x100) != 0;
-			cs.isMine = (pc->controler == mySeat);
-			cs.ctrl = pc->controler;
-			cs.loc = pc->location;
-			cs.seq = pc->sequence;
-			cs.summary = std::string(cs.isMine ? "我方" : "对手") + "[" + CardLabel(cs.code, cs.name) + "]" +
-				(cs.descText.empty() ? "" : "（" + cs.descText + "）") + " 可以连锁";
-			if (!targetLabel.empty()) cs.summary += " " + std::string(s.chainStackFull.empty() ? "" : (s.chainStackFull.back().isMine ? "我方" : "对手")) + "[" + targetLabel + "]";
-			cs.summary += cs.forced ? " — 必发" : " — 可选";
-			s.chainCandidates.push_back(std::move(cs));
-		}
-		s.canDecline = !f.chain_forced;
-		// readable hint: SELECT_CHAIN hint (MSG_HINT/HINT_SELECTMSG) if any
-		s.chainHint.clear();
-		if (f.select_hint > 0) s.chainHint = DescTextOf(f.select_hint);
-		if (s.chainHint.empty() && g_lastHintType.load() == HINT_SELECTMSG) s.chainHint = DescTextOf(g_lastHintData.load());
-		// last chain event (readable)
-		const unsigned long long evSeq = g_chainEventSeq.load();
-		if (evSeq) {
-			const int evMsg = g_chainEventMsg.load();
-			const unsigned evCode = g_chainEventCode.load();
-			const std::string nm = CardLabel(evCode, CardNameOf(evCode));
-			const std::string dt = DescTextOf(g_chainEventDesc.load());
-			const std::string dtLabel = dt.empty() ? (nm + " 的效果") : dt;
-			const bool mine = (g_chainEventCtrl.load() == mySeat);
-			if (evMsg == MSG_CHAINING) {
-				s.lastChainEvent = std::string(mine ? "我方" : "对手") + "发动 [" + nm + "]（" + dtLabel + "）→ 连锁";
-			} else if (evMsg == MSG_CHAINED) {
-				s.lastChainEvent = "连锁成立: [" + nm + "]";
-			} else if (evMsg == MSG_CHAIN_SOLVED) {
-				s.lastChainEvent = "连锁结算: [" + nm + "]";
-			} else if (evMsg == MSG_CHAIN_END) {
-				s.lastChainEvent = "连锁结束（清空）";
-			}
-		}
-		// readable "active effects" = the chain stack (cleared by the client on MSG_CHAIN_END)
-		s.activeEffectLines.clear();
-		for (const auto& ls : s.chainStackFull) s.activeEffectLines.push_back(ls.summary);
-	}
-	s.options = f.select_options;
-	{
-		unsigned int mask = f.selectable_field;
-		s.selectableFieldMask = mask;
-		s.isFirst = mainGame->dInfo.isFirst;
-		// UI / chain-mode snapshot (read on the UI thread, so no extra locking needed here)
-		// chainMode is derived from the REAL booleans (the client may have overwritten them at
-		// duel start); desired/applied are reported separately by UiJson().
-		s.chainMode = mainGame->always_chain ? 0 : (mainGame->ignore_chain ? 2 : 1);
-		s.alwaysChain = mainGame->always_chain;
-		s.chainWhenAvail = mainGame->chain_when_avail;
-		s.ignoreChain = mainGame->ignore_chain;
-		s.popupMask = PopupBits();
-		s.uiCleanupCount = g_uiCleanupCount.load();
-		s.windows = CollectWindows(); // task-22: /ui.windows diagnostics
-		for (int bit = 0; bit < 32; ++bit) {
-			if (!(mask & (1u << bit))) continue;
-			int ctrl = (bit >= 16) ? 1 : 0;
-			int within = bit - (ctrl ? 16 : 0);
-			int loc = (within >= 8) ? LOCATION_SZONE : LOCATION_MZONE;
-			int seq = within & 0x7;
-			Snapshot::PlaceSnap ps; ps.ctrl = ctrl; ps.loc = loc; ps.seq = seq; ps.bit = bit;
-			s.places.push_back(ps);
-		}
-	}
-	s.valid = true;
-}
 
 // --- queued actions, executed on the UI thread inside Game::MainLoop() ---
 // Load a .ydk by its section markers (#main / #extra / !side). The stock loader classifies
@@ -2594,7 +1775,13 @@ void ServerLoop(int port) {
 #endif
 }
 
-} // namespace
+} // namespace ctl
+
+// The original control.cpp kept every entity in an anonymous namespace, whose members are
+// implicitly visible from the enclosing namespace ygo.  A NAMED namespace is not visible that
+// way, so the Control:: entry points defined below need this using-directive to keep the
+// pre-refactor unqualified references (g_mutex, Action, CtlDbg, ...) compiling unchanged.
+using namespace ctl;
 
 void Control::EnsureStarted() {
 	static std::once_flag once;
@@ -3005,4 +2192,3 @@ void Control::Pump() {
 }
 
 } // namespace ygo
-
