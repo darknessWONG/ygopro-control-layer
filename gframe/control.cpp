@@ -57,6 +57,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <ctime>
 #include <vector>
 
 #include "control.h"
@@ -94,6 +96,9 @@ bool IsPromptMsg(int id) {
 std::mutex g_mutex;
 std::condition_variable g_cv;
 Snapshot g_shared;
+// task-28f: the state captured when the current prompt was published (see control_internal.h)
+Snapshot g_promptSnap;
+std::atomic<bool> g_promptSnapValid{ false };
 uint64_t g_seq{ 0 };
 bool g_awaiting{ false };
 std::deque<Action> g_actions;
@@ -111,12 +116,15 @@ unsigned char g_lastRaw[4096]{};
 size_t g_lastRawLen = 0;
 int g_phase = -1;
 int g_winPlayer = -1;
+int g_winPlayerLocal = -1; // task-28g: raw winner mapped to local view (0=me, 1=opponent, -1 unknown/draw)
 int g_winReason = -1;
 bool g_readySent = false;
 std::atomic<bool> g_snapshotWanted{ false };
 bool g_promptWanted = false;
 int g_timeLeft = -1;
 int g_turnPlayer = -1;
+int g_turnPlayerLocal = -1;
+std::deque<int> g_msgTrail; // task-28c: recent game-message ids (ranked stall diagnostics)
 int g_errMsg = -1;
 unsigned g_errCode = 0;
 std::vector<unsigned> g_sentMain;
@@ -444,16 +452,719 @@ void HandleClient(SOCKET sock) {
 #endif
 }
 
+// ===========================================================================
+// task-28: reconnect basics (network liveness + /tip prober + journal + modal suppression)
+// Design: bridge/docs/RECONNECT-DESIGN.md   Implementation notes: docs/net-probe.md
+// ===========================================================================
+std::atomic<uint64_t> g_lastStocTick{ 0 };
+std::atomic<bool> g_netConnected{ false };
+std::atomic<bool> g_netJoined{ false };
+std::atomic<bool> g_netAlive{ true };
+std::atomic<int> g_netAliveHits{ 0 }; // consecutive real STOCs while dead (debounce recovery)
+// task-28 fix: single source of truth for /net.state + /net.alive (prober writes it, NetJson reads it)
+std::atomic<int> g_netState{ ctl::NET_STATE_IDLE };
+std::atomic<int> g_netProbeFails{ 0 };
+std::atomic<uint64_t> g_netProbeLastSent{ 0 };
+std::atomic<uint64_t> g_netProbeLastReply{ 0 };
+std::atomic<int> g_netProbeRtt{ -1 };
+std::atomic<int> g_netProbeReplyType{ -1 };
+std::atomic<uint64_t> g_netProbePendingSince{ 0 };
+std::atomic<uint64_t> g_netProbeForce{ 0 };
+std::atomic<uint64_t> g_netAliveSince{ 0 };
+std::atomic<bool> g_netProbeEnabled{ true };
+std::atomic<bool> g_netProbeUnsupported{ false };
+std::atomic<int> g_netProbeRequireSystem{ 1 }; // only STOC_CHAT(player_type==8) counts as /tip reply
+std::atomic<uint64_t> g_netProbeTrafficTick{ 0 }; // last non-chat STOC (generic liveness during probe)
+std::atomic<int> g_netProbeIdleMs{ 2500 };     // probe when no STOC for this long
+std::atomic<int> g_netProbeGapMs{ 3000 };      // min interval between probes
+std::atomic<int> g_netProbeWindowMs{ 1500 };   // reply window after sending /tip
+std::atomic<int> g_netProbeSilenceMs{ 10000 }; // passive "confirmed dead" silence threshold
+std::atomic<uint64_t> g_lastNetMsgTick{ 0 };
+std::atomic<int> g_lastNetMsgId{ -1 };
+bool g_suppressModals{ true };
+bool g_journalEnabled{ true };
+std::mutex g_netMutex;
+std::string g_netCloseReason{ "none" };
+// task-28h: chain-candidate capture (definitions; see control_internal.h)
+std::mutex g_chainAnalyzeMutex;
+int g_chainAnalyzeCount{ -1 };
+int g_chainAnalyzeMsg{ 0 };
+int g_chainAnalyzeDepth{ 0 };
+std::atomic<bool> g_chainCaptureWanted{ false };
+std::atomic<uint64_t> g_ctosAtMsgBegin{ 0 };
+std::atomic<int> g_lastChainRawCount{ 0 };
+std::atomic<int> g_lastChainRawSpecount{ 0 };
+ChainCandRaw g_chainAnalyzeCands[64];
+
+void CaptureChainAnalyze() {
+	if (!mainGame) return;
+	const int m = (int)mainGame->dInfo.curMsg;
+	if (m != MSG_SELECT_CHAIN && m != MSG_SELECT_IDLECMD && m != MSG_SELECT_BATTLECMD &&
+		m != MSG_SELECT_EFFECTYN && m != MSG_SELECT_YESNO) return;
+	auto& f = mainGame->dField;
+	ChainCandRaw tmp[64];
+	int n = 0;
+	for (size_t i = 0; i < f.activatable_cards.size() && n < 64; ++i) {
+		ClientCard* pc = f.activatable_cards[i];
+		if (!pc) continue;
+		ChainCandRaw r;
+		r.code = pc->code;
+		r.ctrl = pc->controler;
+		r.loc = pc->location;
+		r.seq = (int)i; // message order == response index
+		if (i < f.activatable_descs.size()) {
+			r.desc = f.activatable_descs[i].first;
+			r.flag = f.activatable_descs[i].second;
+		}
+		tmp[n++] = r;
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_chainAnalyzeMutex);
+		g_chainAnalyzeCount = n;
+		g_chainAnalyzeMsg = m;
+		g_chainAnalyzeDepth = (int)f.chains.size();
+		if (n) std::memcpy(g_chainAnalyzeCands, tmp, sizeof(ChainCandRaw) * (size_t)n);
+	}
+	Control::Log("CHAIN capture curMsg=%d depth=%zu activatable=%zu descs=%zu cands=%d",
+		m, f.chains.size(), f.activatable_cards.size(), f.activatable_descs.size(), n);
+}
+
+std::string g_netProbeLastText;
+std::string g_netLastMsgText;
+std::string g_lastRoomAddr;
+int g_lastRoomPort{ 0 };
+std::string g_lastRoomPassHash;
+int g_controlPort{ 7788 }; // task-28: journal files are isolated per control port
+bool g_resumePresent{ false };
+uint64_t g_resumeSavedAtMs{ 0 };
+long long g_resumeGapMs{ 0 };
+int g_resumeTurn{ 0 };
+int g_resumeSeat{ -1 };
+int g_resumeChainDepth{ 0 };
+std::vector<ChainLinkSnap> g_resumeChainStack;
+std::string g_resumeChainingTo;
+std::string g_resumePendingPrompt;
+std::string g_resumeReason;
+
+static uint64_t EpochMs() {
+	return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+}
+static std::string IsoUtc(uint64_t ms) {
+	const time_t t = (time_t)(ms / 1000);
+	struct tm tmv{};
+#ifdef _WIN32
+	gmtime_s(&tmv, &t);
+#else
+	gmtime_r(&t, &tmv);
+#endif
+	char b[32];
+	strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+	return b;
+}
+
+void SetLastRoom(const std::string& addr, int port, const std::string& pass) {
+	std::lock_guard<std::mutex> lk(g_netMutex);
+	g_lastRoomAddr = addr;
+	g_lastRoomPort = port;
+	// never store the plain password: FNV-1a 64 is enough for "same room / same pass" checks
+	uint64_t h = 1469598103934665603ull;
+	for (unsigned char c : pass) { h ^= c; h *= 1099511628211ull; }
+	char b[32];
+	snprintf(b, sizeof b, "fnv1a:%016llx", (unsigned long long)h);
+	g_lastRoomPassHash = b;
+}
+
+static const char* NetStateToStr(int st) {
+	switch (st) {
+	case NET_STATE_DISCONNECTED: return "disconnected";
+	case NET_STATE_IDLE: return "idle";
+	case NET_STATE_HEALTHY: return "healthy";
+	case NET_STATE_PROBING: return "probing";
+	case NET_STATE_PROBE_FAILED: return "probe_failed";
+	case NET_STATE_UNSUPPORTED: return "unsupported";
+	case NET_STATE_CONFIRMED_DEAD: return "confirmed_dead";
+	default: return "idle";
+	}
+}
+static int NetConnectState() {
+	if (!g_netConnected.load()) return 0;
+	return g_netJoined.load() ? 3 : 2;
+}
+
+std::string NetJson() {
+	const uint64_t now = GetTickCount64();
+	const uint64_t last = g_lastStocTick.load();
+	const long long since = last ? (long long)(now - last) : -1;
+	const bool connected = g_netConnected.load();
+	// task-28 fix: single source of truth - the prober writes g_netState, /net derives alive from it
+	const int stateCode = g_netState.load();
+	const bool alive = connected &&
+		stateCode != NET_STATE_CONFIRMED_DEAD && stateCode != NET_STATE_DISCONNECTED;
+	std::string closeReason, lastProbeText, lastMsgText;
+	{
+		std::lock_guard<std::mutex> lk(g_netMutex);
+		closeReason = g_netCloseReason;
+		lastProbeText = g_netProbeLastText;
+		lastMsgText = g_netLastMsgText;
+	}
+	// inDuel/turn: g_shared is only written by the UI thread; reading a copy for /net (like /state
+	// already does) avoids touching widgets from the HTTP thread.
+	const bool inDuel = g_shared.inDuel;
+	const int turn = g_shared.turn;
+	const uint64_t msgTick = g_lastNetMsgTick.load();
+	const long long msgAge = msgTick ? (long long)(now - msgTick) : -1;
+	std::ostringstream os;
+	os << "{\"connected\":" << (connected ? "true" : "false")
+	   << ",\"connectState\":" << NetConnectState()
+	   << ",\"closeReason\":\"" << JsonEscape(closeReason) << '"'
+	   << ",\"joined\":" << (g_netJoined.load() ? "true" : "false")
+	   << ",\"inDuel\":" << (inDuel ? "true" : "false")
+	   << ",\"turn\":" << turn
+	   << ",\"lastStocAt\":" << (unsigned long long)last
+	   << ",\"lastStocName\":\"" << StocName(g_lastStocId.load()) << '"'
+	   << ",\"sinceLastStoc\":" << since
+	   << ",\"alive\":" << (alive ? "true" : "false")
+	   << ",\"state\":\"" << NetStateToStr(stateCode) << '"'
+	   << ",\"uptimeMs\":" << (unsigned long long)g_netAliveSince.load()
+	   << ",\"probe\":{\"enabled\":" << ((g_netProbeEnabled.load() && !g_netProbeUnsupported.load()) ? "true" : "false")
+	   << ",\"unsupported\":" << (g_netProbeUnsupported.load() ? "true" : "false")
+	   << ",\"lastSentAt\":" << (unsigned long long)g_netProbeLastSent.load()
+	   << ",\"lastReplyAt\":" << (unsigned long long)g_netProbeLastReply.load()
+	   << ",\"rttMs\":" << g_netProbeRtt.load()
+	   << ",\"fails\":" << g_netProbeFails.load()
+	   << ",\"lastReplyPlayerType\":" << g_netProbeReplyType.load()
+	   << ",\"lastReplyText\":\"" << JsonEscape(lastProbeText) << "\"}"
+	   << ",\"lastNetMsg\":{\"id\":" << g_lastNetMsgId.load()
+	   << ",\"text\":\"" << JsonEscape(lastMsgText) << '"'
+	   << ",\"ageMs\":" << msgAge << '}'
+	   << ",\"version\":\"net-1\"}";
+	return os.str();
+}
+
+// --- journal (resume-context.json) -----------------------------------------
+
+static std::string JournalPath() {
+	if (const char* p = std::getenv("YGO_RESUME_PATH")) return p;
+	// one journal per control port: LAN/multi-client setups share one game dir, and a single
+	// resume-context.json would let them overwrite each other (see net-probe.md).
+	char b[64];
+	snprintf(b, sizeof b, "resume-context-%d.json", g_controlPort);
+	return b;
+}
+
+static void JournalWrite(const Snapshot& s) {
+	const uint64_t savedAt = EpochMs();
+	std::ostringstream os;
+	os << "{\"savedAt\":\"" << IsoUtc(savedAt) << '"'
+	   << ",\"savedAtMs\":" << (unsigned long long)savedAt;
+	// room: the host client has no /join call, and in LAN tests both clients share one game dir,
+	// so when we have no room of our own inherit the peer-written one instead of clobbering it.
+	std::string roomAddr;
+	int roomPort = 0;
+	std::string roomHash;
+	{
+		std::lock_guard<std::mutex> lk(g_netMutex);
+		roomAddr = g_lastRoomAddr;
+		roomPort = g_lastRoomPort;
+		roomHash = g_lastRoomPassHash;
+	}
+	if (roomPort <= 0) {
+		FILE* rf = fopen(JournalPath().c_str(), "rb");
+		if (rf) {
+			std::string old;
+			char b[4096];
+			size_t n;
+			while ((n = fread(b, 1, sizeof b, rf)) > 0) old.append(b, n);
+			fclose(rf);
+			auto grab = [&old](const char* key, std::string& out) {
+				const std::string k = std::string("\"") + key + "\":\"";
+				const size_t p = old.find(k);
+				if (p == std::string::npos) return;
+				const size_t from = p + k.size();
+				const size_t e = old.find('"', from);
+				if (e != std::string::npos) out = old.substr(from, e - from);
+			};
+			std::string sa, sh;
+			grab("addr", sa);
+			grab("passHash", sh);
+			long long sp = 0;
+			const size_t pk = old.find("\"port\":");
+			if (pk != std::string::npos) sp = strtoll(old.c_str() + pk + 7, nullptr, 10);
+			if (sp > 0) { roomAddr = sa; roomPort = (int)sp; roomHash = sh; }
+		}
+	}
+	os << ",\"room\":{\"addr\":\"" << JsonEscape(roomAddr) << '"'
+	   << ",\"port\":" << roomPort
+	   << ",\"passHash\":\"" << JsonEscape(roomHash) << "\"}";
+	os << ",\"turn\":" << s.turn
+	   << ",\"mySeat\":" << s.mySeat
+	   << ",\"phase\":" << s.phase
+	   << ",\"lp\":[" << s.lp0 << ',' << s.lp1 << ']'
+	   << ",\"chainDepth\":" << s.chainDepth
+	   << ",\"chainStack\":[";
+	for (size_t i = 0; i < s.chainStackFull.size(); ++i) {
+		const auto& c = s.chainStackFull[i];
+		if (i) os << ',';
+		os << "{\"link\":" << c.link << ",\"code\":" << c.code
+		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
+		   << ",\"desc\":" << c.desc
+		   << ",\"descText\":\"" << JsonEscape(c.descText) << '"'
+		   << ",\"ctrl\":" << c.ctrl << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq
+		   << ",\"type\":\"effect\",\"forced\":" << (c.forced ? "true" : "false")
+		   << ",\"isMine\":" << (c.isMine ? "true" : "false")
+		   << ",\"summary\":\"" << JsonEscape(c.summary) << "\"}";
+	}
+	os << ']';
+	if (s.chainingToSummary.empty()) os << ",\"chainingTo\":null";
+	else os << ",\"chainingTo\":{\"summary\":\"" << JsonEscape(s.chainingToSummary) << "\"}";
+	os << ",\"canDecline\":" << (s.canDecline ? "true" : "false")
+	   << ",\"pendingPrompt\":{\"seq\":" << (unsigned long long)g_seq
+	   << ",\"curMsg\":" << s.curMsg
+	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false")
+	   << ",\"chainCandidates\":[";
+	for (size_t i = 0; i < s.chainCandidates.size(); ++i) {
+		const auto& c = s.chainCandidates[i];
+		if (i) os << ',';
+		os << "{\"index\":" << c.index << ",\"code\":" << c.code
+		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
+		   << ",\"forced\":" << (c.forced ? "true" : "false")
+		   << ",\"isMine\":" << (c.isMine ? "true" : "false") << '}';
+	}
+	os << "]}}";
+	const std::string body = os.str();
+	const std::string path = JournalPath();
+	const std::string tmp = path + ".tmp";
+	FILE* f = fopen(tmp.c_str(), "wb");
+	if (!f) return;
+	fwrite(body.data(), 1, body.size(), f);
+	fclose(f);
+#ifdef _WIN32
+	MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+#else
+	rename(tmp.c_str(), path.c_str());
+#endif
+}
+
+void JournalPump() {
+	if (!g_journalEnabled) return;
+	static std::string lastSig;
+	static uint64_t lastWrite = 0;
+	const Snapshot& s = g_shared; // Pump (UI thread) is the only writer
+	if (!s.valid || !s.started) return;
+	const uint64_t now = GetTickCount64();
+	char sig[256];
+	snprintf(sig, sizeof sig, "%d|%d|%zu|%d|%llu|%s", s.turn, s.chainDepth, s.chainStackFull.size(),
+		s.curMsg, (unsigned long long)g_seq, s.lastChainEvent.c_str());
+	const bool changed = (lastSig != sig);
+	if (!changed && now - lastWrite < 5000) return; // 5s heartbeat fallback
+	if (now - lastWrite < 1000) return;            // <=1 write/s
+	JournalWrite(s);
+	lastSig = sig;
+	lastWrite = now;
+}
+
+// minimal JSON field scanners (journal is our own output; no external JSON library needed)
+static bool JFindInt(const std::string& j, const char* key, long long& out) {
+	const std::string k = std::string("\"") + key + "\":";
+	size_t p = j.find(k);
+	if (p == std::string::npos) return false;
+	p += k.size();
+	while (p < j.size() && (j[p] == ' ' || j[p] == '\t')) ++p;
+	char* end = nullptr;
+	const long long v = strtoll(j.c_str() + p, &end, 10);
+	if (end == j.c_str() + p) return false;
+	out = v;
+	return true;
+}
+static bool JFindStr(const std::string& j, const char* key, std::string& out) {
+	const std::string k = std::string("\"") + key + "\":\"";
+	size_t p = j.find(k);
+	if (p == std::string::npos) return false;
+	p += k.size();
+	std::string s;
+	while (p < j.size() && j[p] != '"') {
+		char c = j[p++];
+		if (c == '\\' && p < j.size()) {
+			char e = j[p++];
+			switch (e) {
+			case 'n': s += '\n'; break;
+			case 'r': s += '\r'; break;
+			case 't': s += '\t'; break;
+			case '"': s += '"'; break;
+			case '\\': s += '\\'; break;
+			case 'u': {
+				if (p + 4 <= j.size()) {
+					unsigned cp = (unsigned)strtoul(j.substr(p, 4).c_str(), nullptr, 16);
+					p += 4;
+					if (cp < 0x80) s += (char)cp;
+					else if (cp < 0x800) { s += (char)(0xC0 | (cp >> 6)); s += (char)(0x80 | (cp & 0x3F)); }
+					else { s += (char)(0xE0 | (cp >> 12)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
+				}
+				break;
+			}
+			default: s += e;
+			}
+		} else {
+			s += c;
+		}
+	}
+	out = std::move(s);
+	return true;
+}
+static bool JExtractBlock(const std::string& j, const char* key, std::string& out) {
+	const std::string k = std::string("\"") + key + "\":";
+	size_t p = j.find(k);
+	if (p == std::string::npos) return false;
+	p += k.size();
+	while (p < j.size() && (j[p] == ' ' || j[p] == '\t')) ++p;
+	if (p >= j.size()) return false;
+	const char open = j[p];
+	if (open != '{' && open != '[') return false;
+	const char close = (open == '{') ? '}' : ']';
+	int depth = 0;
+	bool inStr = false;
+	for (size_t i = p; i < j.size(); ++i) {
+		const char c = j[i];
+		if (inStr) {
+			if (c == '\\') { ++i; continue; }
+			if (c == '"') inStr = false;
+			continue;
+		}
+		if (c == '"') { inStr = true; continue; }
+		if (c == open) ++depth;
+		else if (c == close) {
+			if (--depth == 0) { out = j.substr(p, i - p + 1); return true; }
+		}
+	}
+	return false;
+}
+
+void JournalLoadAtStartup() {
+	g_resumePresent = false;
+	g_resumeReason = "absent";
+	const std::string path = JournalPath();
+	FILE* f = fopen(path.c_str(), "rb");
+	if (!f) { Control::Log("RESUME journal absent (%s)", path.c_str()); return; }
+	std::string j;
+	{
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof buf, f)) > 0) j.append(buf, n);
+	}
+	fclose(f);
+	long long savedAtMs = 0, turn = 0, mySeat = 0;
+	if (!JFindInt(j, "savedAtMs", savedAtMs) || !JFindInt(j, "turn", turn)) {
+		g_resumeReason = "parse-error";
+		Control::Log("RESUME journal ignored reason=parse-error");
+		return;
+	}
+	const long long gap = (long long)(EpochMs() - (uint64_t)savedAtMs);
+	if (gap < 0 || gap > 60000) {
+		g_resumeReason = "expired";
+		Control::Log("RESUME journal ignored reason=expired gapMs=%lld", gap);
+		return;
+	}
+	if (turn <= 0) {
+		g_resumeReason = "invalid-turn";
+		Control::Log("RESUME journal ignored reason=invalid-turn");
+		return;
+	}
+	JFindInt(j, "mySeat", mySeat);
+	g_resumePresent = true;
+	g_resumeReason = "loaded"; // meaningful only when resume is null; avoid a stale "absent" on success
+	g_resumeSavedAtMs = (uint64_t)savedAtMs;
+	g_resumeGapMs = gap;
+	g_resumeTurn = (int)turn;
+	g_resumeSeat = (int)mySeat;
+	g_resumeChainDepth = 0;
+	g_resumeChainStack.clear();
+	g_resumeChainingTo.clear();
+	g_resumePendingPrompt.clear();
+	long long depth = 0;
+	if (JFindInt(j, "chainDepth", depth)) g_resumeChainDepth = (int)depth;
+	std::string block;
+	if (JExtractBlock(j, "chainStack", block) && block.size() > 2 && block[0] == '[') {
+		size_t p = 1;
+		while (p < block.size()) {
+			const size_t ob = block.find('{', p);
+			if (ob == std::string::npos) break;
+			int d = 0;
+			bool inStr = false;
+			size_t end = std::string::npos;
+			for (size_t i = ob; i < block.size(); ++i) {
+				const char c = block[i];
+				if (inStr) { if (c == '\\') { ++i; continue; } if (c == '"') inStr = false; continue; }
+				if (c == '"') { inStr = true; continue; }
+				if (c == '{') ++d;
+				else if (c == '}') { if (--d == 0) { end = i; break; } }
+			}
+			if (end == std::string::npos) break;
+			const std::string obj = block.substr(ob, end - ob + 1);
+			ChainLinkSnap c;
+			long long v = 0;
+			if (JFindInt(obj, "link", v)) c.link = (int)v;
+			if (JFindInt(obj, "code", v)) c.code = (unsigned)v;
+			JFindStr(obj, "name", c.name);
+			if (JFindInt(obj, "desc", v)) c.desc = (int)v;
+			JFindStr(obj, "descText", c.descText);
+			if (JFindInt(obj, "ctrl", v)) c.ctrl = (int)v;
+			if (JFindInt(obj, "loc", v)) c.loc = (int)v;
+			if (JFindInt(obj, "seq", v)) c.seq = (int)v;
+			JFindStr(obj, "summary", c.summary);
+			g_resumeChainStack.push_back(std::move(c));
+			p = end + 1;
+		}
+	}
+	std::string chainingTo;
+	if (JExtractBlock(j, "chainingTo", chainingTo) && chainingTo.size() > 2) {
+		JFindStr(chainingTo, "summary", g_resumeChainingTo);
+	}
+	std::string pending;
+	if (JExtractBlock(j, "pendingPrompt", pending) && pending.size() > 2) g_resumePendingPrompt = pending;
+	Control::Log("RESUME journal loaded savedAt=%llu gapMs=%lld turn=%d seat=%d chainDepth=%d stack=%zu",
+		(unsigned long long)g_resumeSavedAtMs, g_resumeGapMs, g_resumeTurn, g_resumeSeat,
+		g_resumeChainDepth, g_resumeChainStack.size());
+}
+
+std::string ResumeJson() {
+	if (!g_resumePresent) return "null";
+	std::ostringstream os;
+	os << "{\"stale\":true,\"fromJournal\":true"
+	   << ",\"savedAt\":" << (unsigned long long)g_resumeSavedAtMs
+	   << ",\"gapMs\":" << g_resumeGapMs
+	   << ",\"preTurn\":" << g_resumeTurn
+	   << ",\"chainDepth\":" << g_resumeChainDepth
+	   << ",\"chainStack\":[";
+	for (size_t i = 0; i < g_resumeChainStack.size(); ++i) {
+		const auto& c = g_resumeChainStack[i];
+		if (i) os << ',';
+		os << "{\"link\":" << c.link << ",\"code\":" << c.code
+		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
+		   << ",\"descText\":\"" << JsonEscape(c.descText) << '"'
+		   << ",\"summary\":\"" << JsonEscape(c.summary) << "\"}";
+	}
+	os << ']';
+	if (g_resumeChainingTo.empty()) os << ",\"chainingTo\":null";
+	else os << ",\"chainingTo\":{\"summary\":\"" << JsonEscape(g_resumeChainingTo) << "\"}";
+	os << ",\"pendingPrompt\":" << (g_resumePendingPrompt.empty() ? "null" : g_resumePendingPrompt)
+	   << ",\"reason\":\"" << JsonEscape(g_resumeReason) << "\"}";
+	return os.str();
+}
+
+// --- prober (UI thread only) -----------------------------------------------
+
+static void NetPumpProber(uint64_t now) {
+	if (!g_netConnected.load()) return;
+	const bool dueling = mainGame && mainGame->dInfo.isStarted && mainGame->dInfo.isInDuel;
+	const uint64_t last = g_lastStocTick.load();
+	const long long since = last ? (long long)(now - last) : -1;
+	const uint64_t pend = g_netProbePendingSince.load();
+	const uint64_t windowMs = (uint64_t)g_netProbeWindowMs.load();
+	// ---- resolve an in-flight probe -------------------------------------
+	if (pend) {
+		const uint64_t reply = g_netProbeLastReply.load();
+		const uint64_t traffic = g_netProbeTrafficTick.load();
+		if (reply >= pend) {
+			// reply >= pend (same-millisecond reply is valid too): cancel the timeout immediately
+			const int rtt = reply > pend ? (int)(reply - pend) : 0;
+			g_netProbePendingSince.store(0);
+			g_netProbeRtt.store(rtt);
+			g_netProbeFails.store(0);
+			g_netAliveHits.store(0);
+			const bool wasDead = !g_netAlive.exchange(true);
+			g_netState.store(NET_STATE_HEALTHY);
+			Control::Log("NET probe reply rtt=%dms playerType=%d%s", rtt, g_netProbeReplyType.load(),
+				wasDead ? " (alive recovered)" : "");
+		} else if (now - pend > windowMs) {
+			g_netProbePendingSince.store(0);
+			if (traffic > pend) {
+				// Non-chat traffic flowed during the window but the server did not answer /tip with a
+				// system message (typical for LAN servers): treat the link as alive and degrade to the
+				// passive sinceLastStoc detector instead of counting false failures.
+				g_netProbeUnsupported.store(true);
+				g_netProbeFails.store(0);
+				g_netAlive.store(true);
+				g_netState.store(NET_STATE_UNSUPPORTED);
+				g_netAliveSince.store(now);
+				Control::Log("NET probe unsupported (traffic ok, no system /tip reply) -> passive mode");
+			} else {
+				const int fails = g_netProbeFails.fetch_add(1) + 1;
+				Control::Log("NET probe timeout fails=%d sinceStoc=%lldms", fails, since);
+				if (fails >= 2) {
+					g_netAlive.store(false);
+					g_netState.store(NET_STATE_CONFIRMED_DEAD);
+					Control::Log("NET DEAD reason=probe-fails fails=%d", fails);
+				} else {
+					g_netState.store(NET_STATE_PROBE_FAILED);
+				}
+			}
+		}
+	}
+	if (!dueling) return;
+	// ---- passive death check (also the LAN / no-/tip path) --------------
+	const long long silenceMs = (long long)g_netProbeSilenceMs.load();
+	if (since > silenceMs && now - g_netAliveSince.load() > 2500) {
+		bool busy = false;
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			busy = g_awaiting || !g_actions.empty();
+		}
+		if (!busy && !g_uiPending.active && g_netAlive.exchange(false)) {
+			g_netState.store(NET_STATE_CONFIRMED_DEAD);
+			Control::Log("NET DEAD reason=stoc-timeout since=%lldms", since);
+		}
+	}
+	// ---- healthy/idle bookkeeping (single source of truth) --------------
+	{
+		const int st = g_netState.load();
+		if (st == NET_STATE_HEALTHY && since > 3000) g_netState.store(NET_STATE_IDLE);
+		else if (st == NET_STATE_IDLE && since >= 0 && since <= 3000) g_netState.store(NET_STATE_HEALTHY);
+	}
+	// ---- send a new probe ----------------------------------------------
+	if (!g_netProbeEnabled.load() || g_netProbeUnsupported.load()) return;
+	if (!g_netAlive.load() || g_netProbePendingSince.load() != 0) return;
+	const bool manual = g_netProbeForce.exchange(0) != 0;
+	const bool idleEnough = since > (long long)g_netProbeIdleMs.load();
+	const bool intervalOk = now - g_netProbeLastSent.load() >= (uint64_t)g_netProbeGapMs.load();
+	bool busy = false;
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		busy = g_awaiting || !g_actions.empty();
+	}
+	if ((manual || (idleEnough && intervalOk)) && !busy && !g_uiPending.active) {
+		uint16_t buf[8] = { L'/', L't', L'i', L'p', 0 };
+		DuelClient::SendBufferToServer(CTOS_CHAT, buf, 5 * sizeof(uint16_t));
+		g_netProbeLastSent.store(now);
+		g_netProbePendingSince.store(now);
+		g_netState.store(NET_STATE_PROBING);
+		Control::Log("NET probe sent (%s) sinceStoc=%lldms", manual ? "manual" : "auto", since);
+	}
+}
+
+// --- network lifecycle hooks (called from DuelClient) ----------------------
+
+void NetOnConnected() {
+	g_netConnected.store(true);
+	g_netJoined.store(false);
+	g_netAlive.store(true);
+	g_netAliveHits.store(0);
+	g_netState.store(NET_STATE_HEALTHY);
+	g_netAliveSince.store(GetTickCount64());
+	g_netProbeFails.store(0);
+	g_netProbePendingSince.store(0);
+	{
+		std::lock_guard<std::mutex> lk(g_netMutex);
+		g_netCloseReason = "none";
+	}
+	Control::Log("NET connected");
+}
+void NetOnJoined() {
+	g_netJoined.store(true);
+	Control::Log("NET joined room");
+}
+void NetOnDisconnected(const char* reason) {
+	const bool was = g_netConnected.exchange(false);
+	g_netJoined.store(false);
+	g_netProbePendingSince.store(0);
+	// task-28 fix: a dead transport must immediately report alive=false (supervisor keys off it)
+	g_netAlive.store(false);
+	g_netAliveHits.store(0);
+	g_netState.store(NET_STATE_DISCONNECTED);
+	{
+		std::lock_guard<std::mutex> lk(g_netMutex);
+		g_netCloseReason = reason ? reason : "unknown";
+	}
+	if (was) Control::Log("NET disconnected reason=%s", reason ? reason : "unknown");
+}
+
+void NotifyUserImpl(int msgId, const char* tag) {
+	const wchar_t* wtext = dataManager.GetSysString(msgId);
+	const std::string text = wtext ? WideToUtf8(wtext) : std::string();
+	g_lastNetMsgId.store(msgId);
+	g_lastNetMsgTick.store(GetTickCount64());
+	{
+		std::lock_guard<std::mutex> lk(g_netMutex);
+		g_netLastMsgText = text;
+	}
+	if (g_suppressModals) {
+		Control::Log("NETMSG suppressed id=%d tag=%s text=%s", msgId, tag ? tag : "", text.c_str());
+		return;
+	}
+	Control::Log("NETMSG modal id=%d tag=%s text=%s", msgId, tag ? tag : "", text.c_str());
+	mainGame->env->addMessageBox(L"", wtext ? wtext : L"");
+}
+
+// task-29a: deck errors (see control_internal.h)
+static std::mutex g_deckMutex;
+static std::string g_deckErrLocalText;
+static std::string g_deckErrServerText;
+static std::atomic<int> g_deckErrLocalType{ -1 };
+static std::atomic<unsigned> g_deckErrLocalCode{ 0 };
+static std::atomic<int> g_deckErrServerType{ -1 };
+static std::atomic<unsigned> g_deckErrServerCode{ 0 };
+
+void NotifyUserTextImpl(const wchar_t* text, const char* tag) {
+	const std::string utf8 = text ? WideToUtf8(text) : std::string();
+	g_lastNetMsgTick.store(GetTickCount64());
+	{
+		std::lock_guard<std::mutex> lk(g_netMutex);
+		g_netLastMsgText = utf8;
+	}
+	if (g_suppressModals) {
+		Control::Log("NETMSG suppressed tag=%s text=%s", tag ? tag : "", utf8.c_str());
+		return;
+	}
+	Control::Log("NETMSG modal tag=%s text=%s", tag ? tag : "", utf8.c_str());
+	mainGame->env->addMessageBox(L"", text ? text : L"");
+}
+
+void OnDeckErrorImpl(unsigned type, unsigned code, const char* text) {
+	g_deckErrServerType.store((int)type);
+	g_deckErrServerCode.store(code);
+	{
+		std::lock_guard<std::mutex> lk(g_deckMutex);
+		g_deckErrServerText = text ? text : "";
+	}
+	Control::Log("DECK ERROR server type=%u code=%u text=%s", type, code, text ? text : "");
+}
+
+void SetDeckErrorLocal(const char* reason, unsigned type, unsigned code) {
+	g_deckErrLocalType.store((int)type);
+	g_deckErrLocalCode.store(code);
+	{
+		std::lock_guard<std::mutex> lk(g_deckMutex);
+		g_deckErrLocalText = reason ? reason : "";
+	}
+	Control::Log("DECK ERROR local reason=%s type=%u code=%u",
+		reason ? reason : "", type, code);
+}
+
+std::string DeckErrorJson() {
+	std::string localText, serverText;
+	{
+		std::lock_guard<std::mutex> lk(g_deckMutex);
+		localText = g_deckErrLocalText;
+		serverText = g_deckErrServerText;
+	}
+	std::ostringstream os;
+	os << "{\"local\":{\"set\":" << (g_deckErrLocalType.load() >= 0 ? "true" : "false")
+	   << ",\"reason\":\"" << JsonEscape(localText) << '"'
+	   << ",\"type\":" << g_deckErrLocalType.load()
+	   << ",\"code\":" << g_deckErrLocalCode.load() << '}'
+	   << ",\"server\":{\"set\":" << (g_deckErrServerType.load() >= 0 ? "true" : "false")
+	   << ",\"type\":" << g_deckErrServerType.load()
+	   << ",\"code\":" << g_deckErrServerCode.load()
+	   << ",\"text\":\"" << JsonEscape(serverText) << "\"}}";
+	return os.str();
+}
+
 // ---------------------------------------------------------------------------
-// RouteRequest: the HTTP endpoint table that used to be inlined inside
-// HandleClient.  The two error paths previously used cross-scope `goto`s that
-// jumped out of a lock_guard scope to reach the response writer; they are now
-// plain `return body;`.  The lock_guard destructor still releases g_mutex before
-// the caller writes the response, but nothing relies on goto scoping any more.
+// RouteRequest: the HTTP endpoint table (see bridge/docs/MCP-INTERFACE.md)
 // ---------------------------------------------------------------------------
 std::string RouteRequest(const std::string& path, const std::string& query, std::string& status) {
 	std::string body;
-		if (path == "/health") {
+	if (path == "/health") {
 			body = g_started.load() ? "{\"ok\":true,\"started\":true}" : "{\"ok\":true,\"started\":false}";
 		} else if (path == "/state") {
 			std::lock_guard<std::mutex> lk(g_mutex);
@@ -505,10 +1216,21 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			body = "{\"ok\":true,\"queued\":true,\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + "}";
 		} else if (path == "/prompt") {
 			std::lock_guard<std::mutex> lk(g_mutex);
-			body = PromptJson(g_shared);
+			// task-28f: while a prompt is outstanding report the frozen prompt snapshot
+			body = PromptJson(g_awaiting && g_promptSnapValid.load() ? g_promptSnap : g_shared);
 		} else if (path == "/actions") {
 			std::lock_guard<std::mutex> lk(g_mutex);
-			body = SemActionsJson(g_shared);
+			if (!g_awaiting) {
+				// task-28c: never advertise an action when no prompt is pending. The old "auto"
+				// fallback made policy clients spam unsolicited responses during MSG_WAITING.
+				std::ostringstream os2;
+				os2 << "{\"actions\":[],\"awaiting\":false,\"curMsg\":" << g_shared.curMsg
+				    << ",\"seq\":" << (unsigned long long)g_seq << ",\"reason\":\"not awaiting\"}";
+				body = os2.str();
+			} else {
+				// task-28f: use the frozen prompt state, not whatever message arrived last
+				body = SemActionsJson(g_promptSnapValid.load() ? g_promptSnap : g_shared);
+			}
 		} else if (path == "/act_id") {
 			int id = atoi(QueryParam(query, "id").c_str());
 			Action act;
@@ -550,7 +1272,8 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			g_cv.wait_for(lk, std::chrono::milliseconds(timeout), [since]() {
 				return g_seq > since || !g_awaiting;
 			});
-			body = PromptJson(g_shared);
+			// task-28f: report the frozen prompt state while awaiting (same source as /prompt)
+			body = PromptJson(g_awaiting && g_promptSnapValid.load() ? g_promptSnap : g_shared);
 		} else if (path == "/stoc") {
 			std::lock_guard<std::mutex> lk(g_mutex);
 			std::ostringstream os;
@@ -694,8 +1417,47 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			a.port = atoi(QueryParam(query, "port").c_str());
 			if (a.port <= 0) a.port = 7911;
 			a.pass = QueryParam(query, "pass");
+			SetLastRoom(a.ip, a.port, a.pass); // task-28: journal remembers the room
 			{
 				std::lock_guard<std::mutex> lk(g_mutex);
+				g_actions.push_back(std::move(a));
+			}
+			body = "{\"ok\":true,\"queued\":true}";
+		} else if (path == "/net") {
+			// task-28: live network state for supervisor / diagnostics (read-only)
+			body = NetJson();
+		} else if (path == "/net/probe") {
+			// manual liveness probe (debug); the prober itself runs automatically in Pump
+			const uint64_t before = g_netProbeLastSent.load();
+			g_netProbeForce.fetch_add(1);
+			uint64_t sentAt = before;
+			bool replied = false;
+			for (int i = 0; i < 60; ++i) {
+#ifdef _WIN32
+				Sleep(50);
+#else
+				usleep(50000);
+#endif
+				sentAt = g_netProbeLastSent.load();
+				if (sentAt > before) {
+					const uint64_t reply = g_netProbeLastReply.load();
+					if (reply > sentAt) { replied = true; break; }
+				}
+			}
+			std::ostringstream os;
+			os << "{\"ok\":" << (replied ? "true" : "false")
+			   << ",\"sent\":" << (sentAt > before ? "true" : "false")
+			   << ",\"rttMs\":" << g_netProbeRtt.load()
+			   << ",\"alive\":" << ((g_netConnected.load() && g_netAlive.load()) ? "true" : "false")
+			   << ",\"fails\":" << g_netProbeFails.load()
+			   << ",\"lastReplyPlayerType\":" << g_netProbeReplyType.load() << '}';
+			body = os.str();
+		} else if (path == "/leave") {
+			// task-28: cleanly leave the current room and return to the main menu
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				Action a;
+				a.kind = ActionKind::Leave;
 				g_actions.push_back(std::move(a));
 			}
 			body = "{\"ok\":true,\"queued\":true}";
@@ -741,6 +1503,14 @@ void ServerLoop(int port) {
 // pre-refactor unqualified references (g_mutex, Action, CtlDbg, ...) compiling unchanged.
 using namespace ctl;
 
+// task-28: Control:: entry points that delegate into ctl (definitions must live in namespace ygo)
+void Control::OnNetConnected() { ctl::NetOnConnected(); }
+void Control::OnNetJoined() { ctl::NetOnJoined(); }
+void Control::OnNetDisconnected(const char* reason) { ctl::NetOnDisconnected(reason); }
+void Control::NotifyUser(int msgId, const char* tag) { ctl::NotifyUserImpl(msgId, tag); }
+void Control::NotifyUserText(const wchar_t* text, const char* tag) { ctl::NotifyUserTextImpl(text, tag); }
+void Control::OnDeckError(unsigned type, unsigned code, const char* text) { ctl::OnDeckErrorImpl(type, code, text); }
+
 void Control::EnsureStarted() {
 	static std::once_flag once;
 	std::call_once(once, []() {
@@ -782,10 +1552,34 @@ void Control::EnsureStarted() {
 		if (const char* ce = std::getenv("YGO_UI_CLOSE_EMPTY")) {
 			g_closeEmpty = (std::strcmp(ce, "0") != 0); // only the empty-frame closer
 		}
-		Control::Log("control: started port=%d hooks=%d autoDismiss=%d placeCoords=%s chainMode=%s uiActions=%d uiEventDirect=%d hideExtra=%d task22=%d closeEmpty=%d (pipeline diagnostics)",
+		// task-28: reconnect basics
+		if (const char* np = std::getenv("YGO_NET_PROBE")) {
+			g_netProbeEnabled = (std::strcmp(np, "0") != 0); // /tip liveness prober (default on)
+		}
+		if (const char* sm = std::getenv("YGO_SUPPRESS_MODALS")) {
+			g_suppressModals = (std::strcmp(sm, "0") != 0); // native disconnect boxes -> log only
+		}
+		if (const char* rj = std::getenv("YGO_RESUME_JOURNAL")) {
+			g_journalEnabled = (std::strcmp(rj, "0") != 0); // resume-context.json writer
+		}
+		if (const char* rs = std::getenv("YGO_NET_PROBE_REQUIRE_SYSTEM")) {
+			g_netProbeRequireSystem.store(std::strcmp(rs, "0") != 0); // only type==8 counts as reply
+		}
+		if (const char* v = std::getenv("YGO_NET_IDLE_MS")) g_netProbeIdleMs.store(std::atoi(v));
+		if (const char* v = std::getenv("YGO_NET_PROBE_GAP_MS")) g_netProbeGapMs.store(std::atoi(v));
+		if (const char* v = std::getenv("YGO_NET_PROBE_WINDOW_MS")) g_netProbeWindowMs.store(std::atoi(v));
+		if (const char* v = std::getenv("YGO_NET_DEAD_SILENCE_MS")) g_netProbeSilenceMs.store(std::atoi(v));
+		g_controlPort = port; // journal path is resume-context-<port>.json (see JournalPath)
+		g_netAliveSince.store(GetTickCount64());
+		JournalLoadAtStartup();
+		Control::Log("NET probe cfg idle=%dms gap=%dms window=%dms silence=%dms requireSystem=%d",
+			g_netProbeIdleMs.load(), g_netProbeGapMs.load(), g_netProbeWindowMs.load(),
+			g_netProbeSilenceMs.load(), g_netProbeRequireSystem.load());
+		Control::Log("control: started port=%d hooks=%d autoDismiss=%d placeCoords=%s chainMode=%s uiActions=%d uiEventDirect=%d hideExtra=%d task22=%d closeEmpty=%d netProbe=%d suppressModals=%d journal=%d (pipeline diagnostics)",
 			port, g_hookMask, g_autoDismiss.load() ? 1 : 0, g_placeCoordsServer ? "server" : "local",
 			ChainModeName(g_chainMode.load()), g_uiActions ? 1 : 0, g_uiEventDirect ? 1 : 0,
-			g_hideExtra ? 1 : 0, g_task22 ? 1 : 0, g_closeEmpty ? 1 : 0);
+			g_hideExtra ? 1 : 0, g_task22 ? 1 : 0, g_closeEmpty ? 1 : 0,
+			g_netProbeEnabled.load() ? 1 : 0, g_suppressModals ? 1 : 0, g_journalEnabled ? 1 : 0);
 		AddVectoredExceptionHandler(1, VexHandler);
 		SetUnhandledExceptionFilter(CrashHandler);
 		std::atexit([]() { Control::Log("process exit (atexit)"); });
@@ -804,6 +1598,34 @@ static void DbgLog(const char* fmt, ...) {
 
 void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, size_t len) {
 	g_lastStocId.store((int)pktType); // pipeline diagnostic: keep even when stoc logging is off
+	// task-28: any server packet proves the link is alive (feeds /net.sinceLastStoc + prober)
+	{
+		const uint64_t now = GetTickCount64();
+		g_lastStocTick.store(now);
+		g_netAliveSince.store(now);
+		// STOC_CHAT is handled by OnChat (which filters the /tip echo); other packets prove the link
+		// is alive and count as a probe success.
+		if (pktType != STOC_CHAT) {
+			g_netProbeTrafficTick.store(now);
+			if (g_netProbePendingSince.load() != 0 && now > g_netProbePendingSince.load()) {
+				g_netProbeLastReply.store(now);
+				g_netProbeReplyType.store(-1);
+			}
+			if (!g_netAlive.load() && g_netConnected.load()) {
+				// debounce recovery: require 2 consecutive real (non-chat) STOCs while dead so alive
+				// does not flap between false/true on a single delayed packet.
+				const int hits = g_netAliveHits.fetch_add(1) + 1;
+				if (hits >= 2) {
+					g_netAlive.store(true);
+					g_netAliveHits.store(0);
+					g_netState.store(NET_STATE_HEALTHY);
+					Control::Log("NET alive recovered (hits=%d stoc=%s)", hits, StocName((int)pktType));
+				}
+			} else {
+				g_netAliveHits.store(0);
+			}
+		}
+	}
 	// Chain-check mode must be forced right after the duel starts (the client resets the three
 	// bools from gameConf at that point, which defaults to "全部时点").  Do this even when the
 	// stoc hook is off (host runs with YGO_HOOKS=msganalyze).
@@ -883,7 +1705,7 @@ void Control::OnHsChange(unsigned char status) {
 	while (g_hsStatuses.size() > 40) g_hsStatuses.pop_front();
 }
 
-void Control::OnChat(const uint16_t* msg, size_t len) {
+void Control::OnChat(uint16_t player_type, const uint16_t* msg, size_t len) {
 	if (!msg || len == 0) return;
 	std::string utf8;
 #ifdef _WIN32
@@ -907,6 +1729,32 @@ void Control::OnChat(const uint16_t* msg, size_t len) {
 	}
 #endif
 	if (utf8.empty()) return;
+	// STOC_CHAT carries a NUL-terminated UTF-16 string -> strip the trailing NUL bytes
+	const size_t nulPos = utf8.find('\0');
+	if (nulPos != std::string::npos) utf8.resize(nulPos);
+	if (utf8.empty()) return;
+	// task-28: only a *system* reply counts as the /tip answer.  LAN servers broadcast the sender's
+	// own chat back (player_type=1, text="/tip") - that must NOT be treated as a liveness reply.
+	{
+		const bool isEcho = (utf8 == "/tip");
+		const bool isSystem = (player_type == 8);
+		const bool accept = !isEcho && (isSystem || !g_netProbeRequireSystem.load());
+		if (accept) {
+			const uint64_t now = GetTickCount64();
+			g_netProbeLastReply.store(now);
+			g_netProbeReplyType.store((int)player_type);
+			{
+				std::lock_guard<std::mutex> lk(g_netMutex);
+				g_netProbeLastText = utf8;
+			}
+			if (g_netProbePendingSince.load() != 0) {
+				Control::Log("NET probe reply chat type=%u text=%s", (unsigned)player_type, utf8.c_str());
+				g_netState.store(NET_STATE_HEALTHY); // /net reflects the reply immediately
+			}
+		} else if (isEcho && g_netProbePendingSince.load() != 0) {
+			Control::Log("NET probe echo ignored (own /tip broadcast)");
+		}
+	}
 	std::lock_guard<std::mutex> lk(g_mutex);
 	g_chats.push_back(std::move(utf8));
 	while (g_chats.size() > 50) g_chats.pop_front();
@@ -927,6 +1775,25 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 	// ------------------------------------------------------------------
 	const int msgId = (int)msg[0];
 	++g_gameMsgCount;
+	// task-28i: remember how many CTOS packets the client had sent before it analyzes this message.
+	// If the count grows during ClientAnalyze the message answered itself (e.g. MSG_SELECT_CHAIN with
+	// count==0 auto-sends -1) and must NOT be published as a prompt to the policy.
+	g_ctosAtMsgBegin.store(g_ctosCount.load());
+	// task-28j: raw SELECT_CHAIN header, to compare with what the client's handler sees
+	// (layout: type u8, selecting_player u8, count u8, specount u8, hint0 i32, hint1 i32, ...)
+	if (msgId == MSG_SELECT_CHAIN && len >= 4) {
+		g_lastChainRawCount.store((int)msg[2]);
+		g_lastChainRawSpecount.store((int)msg[3]);
+		Control::Log("CHAIN raw selecting=%d count=%d specount=%d len=%zu",
+			(int)msg[1], (int)msg[2], (int)msg[3], len);
+	}
+	// task-28c: keep the recent message-id trail (visible in /state.pipeline.recentMsgs) so ranked
+	// stalls can be diagnosed without guessing which MSG ids the server actually sent us.
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		g_msgTrail.push_back(msgId);
+		while (g_msgTrail.size() > 64) g_msgTrail.pop_front();
+	}
 
 	if (msgId == MSG_WIN && len >= 3) {
 		const int winner = (int)msg[1];
@@ -934,10 +1801,14 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 		{
 			std::lock_guard<std::mutex> lk(g_mutex);
 			g_winPlayer = winner;
+			g_winPlayerLocal = (winner <= 1 && mainGame) ? mainGame->LocalPlayer(winner) : -1;
 			g_winReason = reason;
 		}
 		// reason: core writes 1 (LP 0) / 2 (deck-out); Lua Duel.Win() writes WIN_REASON_*.
-		Control::Log("MSG_WIN player=%d reason=%d(%s)", winner, reason, WinReasonName(reason));
+		// NOTE: `player` is the RAW seat; the local view winner is what callers should read.
+		Control::Log("MSG_WIN player=%d localPlayer=%d reason=%d(%s) isWin=%d isDraw=%d",
+			winner, g_winPlayerLocal, reason, WinReasonName(reason),
+			(g_winPlayerLocal == 0) ? 1 : 0, (winner == 2) ? 1 : 0);
 		LogPipeline("msg-win");
 	}
 
@@ -1005,7 +1876,12 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 
 	if (msgId != MSG_RETRY) g_lastNonRetryMsgId.store(msgId);
 
-	if (msgId == MSG_NEW_TURN && len >= 2) { g_turnPlayer = (int)msg[1]; }
+	if (msgId == MSG_NEW_TURN && len >= 2) {
+		g_turnPlayer = (int)msg[1];
+		// JSON compares this against Snapshot.myPlayer (always 0 = local view), so map it the same
+		// way the client maps every other player id.
+		g_turnPlayerLocal = (mainGame ? mainGame->LocalPlayer(g_turnPlayer) : g_turnPlayer);
+	}
 	if (msgId == MSG_NEW_PHASE && len >= 3) {
 		unsigned short ph = 0;
 		std::memcpy(&ph, msg + 1, sizeof(ph));
@@ -1024,10 +1900,48 @@ void Control::OnAnalyzeEnd() {
 	++g_analyzeCount;
 	g_lastAnalyzeTick.store(now);
 	MaybePeriodicPipelineLog();
+	// task-28i/k: a prompt message that the client itself answered during ClientAnalyze is already
+	// handled -> publishing it would make the policy send a duplicate response.  Two detectors:
+	//   1) CTOS count grew (SendResponse() now also notifies OnCtosPacket)
+	//   2) MSG_SELECT_CHAIN with count==0 and specount!=0x7f: the client's handler auto-declines
+	const bool ctosGrew = g_ctosCount.load() > g_ctosAtMsgBegin.load();
+	const int curMsg = mainGame ? (int)mainGame->dInfo.curMsg : 0;
+	const bool chainAutoDecline = (curMsg == MSG_SELECT_CHAIN && g_lastChainRawCount.load() == 0 &&
+		g_lastChainRawSpecount.load() != 0x7f);
+	const bool autoHandled = ctosGrew || chainAutoDecline;
+	// task-28h: remember that the prompt candidates must be captured on the UI thread right now
+	// (dField.activatable_* is UI-thread state; it may be cleared by the next prompt before publish).
+	if (mainGame && IsPromptMsg(curMsg)) {
+		const auto& f = mainGame->dField;
+		// task-28l: show our hand so we can tell "no hand trap" from "server refused to offer it"
+		static const unsigned kHandTraps[] = { 14558127u /*灰流丽*/, 23434538u /*增殖的G*/,
+			97268402u /*效果遮蒙者*/, 94145021u /*小丑与锁鸟*/, 24224830u /*无限泡影*/ };
+		std::string handCodes;
+		int handTraps = 0;
+		const size_t handN = f.hand[0].size();
+		for (size_t i = 0; i < handN; ++i) {
+			const unsigned code = f.hand[0][i] ? f.hand[0][i]->code : 0;
+			char b[16];
+			snprintf(b, sizeof b, "%s%u", handCodes.empty() ? "" : ",", code);
+			handCodes += b;
+			for (unsigned t : kHandTraps) if (code == t) { ++handTraps; break; }
+		}
+		Control::Log("CHAIN analyze curMsg=%d rawCount=%d specount=%d activatable=%zu descs=%zu autoHandled=%d hand=[%s] handTraps=%d",
+			curMsg, g_lastChainRawCount.load(), g_lastChainRawSpecount.load(),
+			f.activatable_cards.size(), f.activatable_descs.size(), autoHandled ? 1 : 0,
+			handCodes.c_str(), handTraps);
+		if (!autoHandled) g_chainCaptureWanted.store(true);
+	}
 	if (!(g_hookMask & 2)) return;
 	// Never touch dField from the packet thread (LAN host runs the server in this process).
 	// Just remember the game moved; Control::Pump (game thread) builds the snapshot.
-	g_promptWanted = !mainGame->dInfo.isReplay && IsPromptMsg((int)mainGame->dInfo.curMsg);
+	const bool isPrompt = !mainGame->dInfo.isReplay && IsPromptMsg(curMsg);
+	if (isPrompt && autoHandled) {
+		Control::Log("PROMPT skip auto-handled msg=%d (client already responded during analyze)", curMsg);
+		g_promptWanted = false;
+	} else {
+		g_promptWanted = isPrompt;
+	}
 	g_snapshotWanted = true;
 }
 
@@ -1074,15 +1988,44 @@ void Control::Pump() {
 		}
 	}
 	MaybePeriodicPipelineLog();
+	// task-28e: MSG_HINT with HINT_MESSAGE pops wMessage and blocks the network thread on
+	// actionSignal.Wait(); it is a human "OK" notification (duelclient.cpp HINT_MESSAGE branch), so in
+	// automation it must be auto-confirmed or analyse freezes forever with curMsg stuck at MSG_HINT(3).
+	// Reuse AutoDismissPump()'s repeated Set() window to survive the Reset()+Wait() race.
+	if (mainGame->dInfo.isInDuel && mainGame->dInfo.curMsg == MSG_HINT &&
+		mainGame->wMessage && mainGame->wMessage->isVisible() &&
+		g_dismissUntilTick.load() == 0) {
+		Control::Log("UI auto-confirm kind=hint-message (MSG_HINT popup) curMsg=%d", (int)mainGame->dInfo.curMsg);
+		g_dismissUntilTick.store(GetTickCount64() + 2000);
+	}
 	AutoDismissPump();
+	if (g_chainCaptureWanted.exchange(false)) CaptureChainAnalyze();
 	if (g_snapshotWanted.exchange(false)) {
 		Snapshot s;
 		SnapshotFromClient(s);
 		bool prompt = g_promptWanted;
 		std::lock_guard<std::mutex> lk(g_mutex);
 		g_shared = std::move(s);
-		if (prompt) { ++g_seq; g_awaiting = true; g_cv.notify_all(); }
+		if (prompt) {
+			++g_seq;
+			g_awaiting = true;
+			// task-28f: freeze the prompt state. Messages that arrive afterwards (MSG_WAITING etc.)
+			// overwrite g_shared, but the outstanding prompt must keep reporting its own curMsg/lists.
+			g_promptSnap = g_shared;
+			g_promptSnapValid.store(true);
+			Control::Log("PROMPT publish seq=%llu msg=%d turn=%d",
+				(unsigned long long)g_seq, g_shared.curMsg, g_shared.turn);
+			if (g_shared.curMsg == MSG_SELECT_CHAIN) {
+				Control::Log("CHAIN publish seq=%llu depth=%d cands=%zu (fromAnalyze=%d)",
+					(unsigned long long)g_seq, g_shared.chainDepth, g_shared.chainCandidates.size(),
+					g_chainAnalyzeCount);
+			}
+			g_cv.notify_all();
+		}
 	}
+	// task-28: liveness prober (/tip) + resume-context journal (both UI-thread only)
+	NetPumpProber(now);
+	JournalPump();
 	std::deque<Action> pending;
 	{
 		std::lock_guard<std::mutex> lk(g_mutex);
@@ -1126,6 +2069,15 @@ void Control::Pump() {
 	if (g_task22) {
 		if (g_closeEmpty) CloseEmptyFrames();
 		if ((g_pumpCount.load() % 15) == 0) LogVisibleWindows();
+	}
+	// task-28d: the MSG_CONFIRM_CARDS "view cards" panel blocks the network thread on
+	// actionSignal.Wait() until its OK button is pressed; automation has to press it.
+	AutoConfirmBlockingUi();
+	// task-28b: a control-layer /join (the reconnect path) skips the normal LAN-mode UI flow, which
+	// is what hides wMainMenu; if it is still up once the duel starts it would cover the board.
+	if (mainGame->dInfo.isStarted && mainGame->wMainMenu && mainGame->wMainMenu->isVisible()) {
+		mainGame->HideElement(mainGame->wMainMenu);
+		Control::Log("UI hide wMainMenu (duel started)");
 	}
 	if (g_applyChainPending.exchange(false)) ApplyChainMode("pump");
 	// ------------------------------------------------------------------

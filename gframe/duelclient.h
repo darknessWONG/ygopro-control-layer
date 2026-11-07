@@ -61,6 +61,7 @@ public:
 		WriteBufferEvent(client_bev, duel_client_write, sizeof(ST) + 3);
 	}
 	static void SendBufferToServer(unsigned char proto, void* buffer, size_t len) {
+		Control::OnCtosPacket(proto); // task-28k: SendResponse() goes through here every time
 		auto p = duel_client_write;
 		if (len > MAX_DATA_SIZE)
 			len = MAX_DATA_SIZE;

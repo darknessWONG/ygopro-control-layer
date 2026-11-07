@@ -112,6 +112,7 @@ bool ExecuteAction(const Action& a) {
 	case ActionKind::Start:
 	case ActionKind::NotReady:
 	case ActionKind::Join:
+	case ActionKind::Leave:
 		return ExecLobbyAction(a);
 	case ActionKind::Int32:
 		// Log the exact bytes we hand back: when the server answers MSG_RETRY, this line

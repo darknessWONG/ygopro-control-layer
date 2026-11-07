@@ -119,7 +119,7 @@ void DuelClient::ConnectTimeout(EventSocket fd, short events, void* arg) {
 		else if(!mainGame->bot_mode && !mainGame->wLanWindow->isVisible())
 			mainGame->ShowElement(mainGame->wLanWindow);
 		soundManager.PlaySoundEffect(SOUND_INFO);
-		mainGame->env->addMessageBox(L"", dataManager.GetSysString(1400));
+		Control::NotifyUser(1400, "connect-timeout"); // task-28: suppressed in automation mode
 		mainGame->gMutex.unlock();
 	}
 	if(client_base)
@@ -128,6 +128,7 @@ void DuelClient::ConnectTimeout(EventSocket fd, short events, void* arg) {
 void DuelClient::StopClient(unsigned reason) {
 	Control::Log("StopClient reason=%u", reason);
 	close_reason = reason;
+	Control::OnNetDisconnected(reason == CLIENT_CLOSE_REASON_EXIT ? "exit" : "stop");
 	if(connect_state == CONNECT_STATE_NONE)
 		return;
 	if(client_base)
@@ -205,8 +206,10 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 		}
 		bufferevent_enable(bev, EV_READ);
 		connect_state |= CONNECT_STATE_CONNECTED;
+		Control::OnNetConnected(); // task-28: /net liveness tracking
 	} else if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
 		bufferevent_disable(bev, EV_READ);
+		Control::OnNetDisconnected((events & BEV_EVENT_EOF) ? "eof" : "error");
 		if(close_reason == CLIENT_CLOSE_REASON_NONE) {
 			if(!(connect_state & CONNECT_STATE_JOINED)) {
 				mainGame->btnCreateHost->setEnabled(true);
@@ -221,9 +224,9 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 					mainGame->ShowElement(mainGame->wLanWindow);
 				soundManager.PlaySoundEffect(SOUND_INFO);
 				if(connect_state == CONNECT_STATE_CONNECTING)
-					mainGame->env->addMessageBox(L"", dataManager.GetSysString(1400));
+					Control::NotifyUser(1400, "connect-failed");
 				else
-					mainGame->env->addMessageBox(L"", dataManager.GetSysString(1402));
+					Control::NotifyUser(1402, "transport");
 				mainGame->gMutex.unlock();
 			} else {
 				if(!mainGame->dInfo.isStarted && !mainGame->is_building) {
@@ -241,13 +244,13 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 					mainGame->wChat->setVisible(false);
 					soundManager.PlaySoundEffect(SOUND_INFO);
 					if(events & BEV_EVENT_EOF)
-						mainGame->env->addMessageBox(L"", dataManager.GetSysString(1401));
-					else mainGame->env->addMessageBox(L"", dataManager.GetSysString(1402));
+						Control::NotifyUser(1401, "disconnect-eof");
+					else Control::NotifyUser(1402, "transport");
 					mainGame->gMutex.unlock();
 				} else {
 					mainGame->gMutex.lock();
 					soundManager.PlaySoundEffect(SOUND_INFO);
-					mainGame->env->addMessageBox(L"", dataManager.GetSysString(1502));
+					Control::NotifyUser(1502, "duel-disconnect");
 					mainGame->btnCreateHost->setEnabled(true);
 					mainGame->btnJoinHost->setEnabled(true);
 					mainGame->btnJoinCancel->setEnabled(true);
@@ -315,11 +318,11 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 			mainGame->gMutex.lock();
 			soundManager.PlaySoundEffect(SOUND_INFO);
 			if(pkt->code == 0)
-				mainGame->env->addMessageBox(L"", dataManager.GetSysString(1403));
+				Control::NotifyUser(1403, "join-fail");
 			else if(pkt->code == 1)
-				mainGame->env->addMessageBox(L"", dataManager.GetSysString(1404));
+				Control::NotifyUser(1404, "join-pass");
 			else if(pkt->code == 2)
-				mainGame->env->addMessageBox(L"", dataManager.GetSysString(1405));
+				Control::NotifyUser(1405, "join-rejected");
 			mainGame->gMutex.unlock();
 			event_base_loopbreak(client_base);
 			break;
@@ -376,7 +379,14 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 			}
 			}
 			soundManager.PlaySoundEffect(SOUND_INFO);
-			mainGame->env->addMessageBox(L"", msgbuf);
+			// task-29a: deck error from the server -> record it for /state.deckError, suppress the
+			// modal in automation mode (a stuck box blocks the prepare flow entirely).
+			{
+				char errUtf8[512]{};
+				WideCharToMultiByte(CP_UTF8, 0, msgbuf, -1, errUtf8, (int)sizeof(errUtf8) - 1, nullptr, nullptr);
+				Control::OnDeckError(flag, code, errUtf8);
+			}
+			Control::NotifyUserText(msgbuf, "deck-error");
 			mainGame->cbCategorySelect->setEnabled(true);
 			mainGame->cbDeckSelect->setEnabled(true);
 			mainGame->gMutex.unlock();
@@ -385,7 +395,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		case ERRMSG_SIDEERROR: {
 			mainGame->gMutex.lock();
 			soundManager.PlaySoundEffect(SOUND_INFO);
-			mainGame->env->addMessageBox(L"", dataManager.GetSysString(1408));
+			Control::NotifyUserText(dataManager.GetSysString(1408), "side-error");
 			mainGame->gMutex.unlock();
 			break;
 		}
@@ -399,7 +409,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 			wchar_t msgbuf[256];
 			myswprintf(msgbuf, dataManager.GetSysString(1411), pkt->code >> 12, (pkt->code >> 4) & 0xff, pkt->code & 0xf);
 			soundManager.PlaySoundEffect(SOUND_INFO);
-			mainGame->env->addMessageBox(L"", msgbuf);
+			Control::NotifyUserText(msgbuf, "ver-error");
 			mainGame->gMutex.unlock();
 			event_base_loopbreak(client_base);
 			break;
@@ -576,6 +586,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		mainGame->dInfo.start_lp = pkt->info.start_lp;
 		watching = 0;
 		connect_state |= CONNECT_STATE_JOINED;
+		Control::OnNetJoined(); // task-28: /net.join
 		CancelConnectTimeout();
 		break;
 	}
@@ -873,7 +884,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		const size_t chat_msg_len = chat_msg_size / sizeof(uint16_t);
 		if (chat_msg[chat_msg_len - 1] != 0)
 			return;
-		Control::OnChat(chat_msg, chat_msg_len);
+		Control::OnChat(chat_player_type, chat_msg, chat_msg_len);
 		int player = chat_player_type;
 		auto play_sound = false;
 		if(player < 4) {

@@ -185,6 +185,8 @@ std::vector<WinSnap> CollectWindows() {
 	add("wFTSelect", mainGame->wFTSelect, nullptr, false);
 	add("wBigCard", mainGame->wBigCard, nullptr, false);
 	add("wChat", mainGame->wChat, nullptr, false);
+	add("wMainMenu", mainGame->wMainMenu, nullptr, false); // must not be visible during a duel
+	add("wLanWindow", mainGame->wLanWindow, nullptr, false);
 	return out;
 }
 
@@ -209,6 +211,42 @@ static void ClickButton(irr::gui::IGUIElement* btn) {
 	} catch (...) {
 		Control::Log("UI inject button id=%d exception (unknown)", btn->getID());
 	}
+}
+
+/**
+ * task-29a: click an existing widget through the normal GUI event path
+ * (used for the host-prepare "ready" button so the client runs its own LoadCurrentDeck/UpdateDeck).
+ */
+bool ClickGuiButton(void* widget) {
+	if (!widget) return false;
+	ClickButton(static_cast<irr::gui::IGUIElement*>(widget));
+	return true;
+}
+
+/**
+ * task-28d: MSG_CONFIRM_CARDS can show a forced "view cards" panel
+ * (duelclient.cpp MSG_CONFIRM_CARDS: !skip_panel && panel_confirm.size() && player_type != 7) and
+ * then BLOCK the network thread on actionSignal.Wait().  A human presses the "OK" button of
+ * wCardSelect (event_handler.cpp BUTTON_CARD_SEL_OK -> HideElement(wCardSelect) + actionSignal.Set()).
+ * In automation nobody clicks it, so ClientAnalyze never returns: analyse freezes and curMsg stays at
+ * the previous id while the connection looks perfectly healthy.
+ *
+ * Only this confirm-only panel is auto-clicked. Real selection prompts (MSG_SELECT_CARD etc.) keep
+ * wCardSelect visible with curMsg != MSG_CONFIRM_CARDS and are left to the /actions decision.
+ */
+bool AutoConfirmBlockingUi() {
+	if (!mainGame || !mainGame->device || !mainGame->dInfo.isInDuel) return false;
+	if (mainGame->dInfo.curMsg != MSG_CONFIRM_CARDS) return false;
+	if (!mainGame->wCardSelect || !mainGame->wCardSelect->isVisible()) return false;
+	if (!mainGame->btnSelectOK || !mainGame->btnSelectOK->isVisible()) return false;
+	const bool awaiting = [&]() {
+		std::lock_guard<std::mutex> lk(g_mutex);
+		return g_awaiting;
+	}();
+	Control::Log("UI auto-confirm kind=card-select-confirm btn=btnSelectOK curMsg=%d awaiting=%d",
+		(int)mainGame->dInfo.curMsg, awaiting ? 1 : 0);
+	ClickButton(mainGame->btnSelectOK);
+	return true;
 }
 
 /** inject one mouse event at screen pixel (x,y) */

@@ -45,7 +45,18 @@ public:
 	static bool AutoTpResult();
 	static void OnCtosPacket(unsigned char proto);
 	// record chat / system messages (UTF-16) so the agent can read server complaints
-	static void OnChat(const uint16_t* msg, size_t len);
+	// task-28: player_type is needed by the /tip liveness probe (==8 means system custom message)
+	static void OnChat(uint16_t player_type, const uint16_t* msg, size_t len);
+	// task-28: network lifecycle hooks (called from DuelClient)
+	static void OnNetConnected();
+	static void OnNetJoined();
+	static void OnNetDisconnected(const char* reason);
+	// task-28: native modal boxes on disconnect paths; suppressed when YGO_SUPPRESS_MODALS != 0
+	static void NotifyUser(int msgId, const char* tag);
+	// generic already-formatted text (deck errors etc.): suppressed/logged under YGO_SUPPRESS_MODALS
+	static void NotifyUserText(const wchar_t* text, const char* tag);
+	// task-29a: remember a server-side deck error (DECKERROR_*) for /state.deckError
+	static void OnDeckError(unsigned type, unsigned code, const char* text);
 	// record HS player-change status bytes (pos<<4 | state, state 9=READY 10=NOTREADY)
 	static void OnHsChange(unsigned char status);
 	// append a line to control.log (crash / flow diagnostics)

@@ -90,8 +90,8 @@ std::string WideToUtf8(const wchar_t* w) {
 static std::string CardNameOf(unsigned code) { return WideToUtf8(dataManager.GetName(code)); }
 static std::string DescTextOf(int desc) { return desc > 0 ? WideToUtf8(dataManager.GetDesc(desc)) : std::string(); }
 
-/** minimal JSON string escaping */
-static std::string JsonEscape(const std::string& s) {
+/** minimal JSON string escaping (also used by control.cpp for /net, journal and resume) */
+std::string JsonEscape(const std::string& s) {
 	std::string o;
 	o.reserve(s.size() + 8);
 	for (unsigned char c : s) {
@@ -347,13 +347,23 @@ std::string SnapshotJson(const Snapshot& s) {
 	   << ",\"started\":" << (s.started ? "true" : "false")
 	   << ",\"turn\":" << s.turn
 	   << ",\"lp\":[" << s.lp0 << ',' << s.lp1 << ']'
+	   << ",\"lpOrder\":\"local\"" // dInfo.lp is LOCAL view: lp[0] = me, lp[1] = opponent
 	   << ",\"phase\":" << s.phase
 	   << ",\"curMsg\":" << s.curMsg
 	   << ",\"myPlayer\":" << s.myPlayer
 	   << ",\"mySeat\":" << s.mySeat
-	   << ",\"turnPlayer\":" << g_turnPlayer << ",\"isMyTurn\":" << (g_turnPlayer == s.myPlayer ? "true" : "false")
+	   << ",\"turnPlayer\":" << g_turnPlayer
+	   << ",\"turnPlayerLocal\":" << g_turnPlayerLocal
+	   // g_turnPlayerLocal is already in local view (0 = me); s.myPlayer is always 0.
+	   << ",\"isMyTurn\":" << (g_turnPlayerLocal == s.myPlayer ? "true" : "false")
 	   << ",\"selftype\":" << (int)DuelClient::selftype
 	   << ",\"winPlayer\":" << g_winPlayer
+	   << ",\"winPlayerLocal\":" << g_winPlayerLocal
+	   // isWin/isDraw are what callers should read: raw winPlayer is a seat id (0/1), and our own
+	   // local player is not necessarily seat 0 (guest is seat 1).
+	   << ",\"isWin\":" << ((g_winPlayerLocal == 0) ? "true" : "false")
+	   << ",\"isLoss\":" << ((g_winPlayerLocal == 1) ? "true" : "false")
+	   << ",\"isDraw\":" << ((g_winPlayer == 2) ? "true" : "false")
 	   << ",\"winReason\":" << g_winReason
 	   << ",\"winReasonName\":\"" << WinReasonName(g_winReason) << '"'
 	   // UI / chain mode (see bridge/docs/ui-fix.md)
@@ -434,8 +444,17 @@ std::string SnapshotJson(const Snapshot& s) {
 	   << ",\"placeVariant\":" << g_placeVariant.load()
 	   << ",\"autoDismiss\":" << (g_autoDismiss.load() ? "true" : "false")
 	   << ",\"dismissCount\":" << (unsigned long long)g_dismissCount.load()
-	   << '}';
+	   << ",\"recentMsgs\":[";
+	for (size_t i = 0; i < s.recentMsgs.size(); ++i) {
+		if (i) os << ',';
+		os << s.recentMsgs[i];
+	}
+	os << "]}";
 	os << ",\"prompt\":" << PromptJson(s);
+	// task-28: network liveness + resume-context journal (see bridge/docs/net-probe.md)
+	os << ",\"net\":" << NetJson();
+	os << ",\"resume\":" << ResumeJson();
+	os << ",\"deckError\":" << DeckErrorJson();
 	os << '}';
 	return os.str();
 }
@@ -467,6 +486,10 @@ void SnapshotFromClient(Snapshot& s) {
 	s.lastMsgId = g_lastMsgId;
 	s.lastMsgLen = g_lastRawLen;
 	s.lastMsgHex = Hex(g_lastRaw, g_lastRawLen);
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		s.recentMsgs.assign(g_msgTrail.begin(), g_msgTrail.end());
+	}
 	s.phase = g_phase;
 	if (!mainGame) return;
 	s.inDuel = mainGame->dInfo.isInDuel;
@@ -665,6 +688,54 @@ void SnapshotFromClient(Snapshot& s) {
 			if (!targetLabel.empty()) cs.summary += " " + std::string(s.chainStackFull.empty() ? "" : (s.chainStackFull.back().isMine ? "我方" : "对手")) + "[" + targetLabel + "]";
 			cs.summary += cs.forced ? " — 必发" : " — 可选";
 			s.chainCandidates.push_back(std::move(cs));
+		}
+		// task-28h: dField.activatable_* may already be cleared at publish time (ranked symptom:
+		// 42x CHAIN-DECLINE with zero candidates while LAN works). Fall back to the analyze-time
+		// capture (CaptureChainAnalyze, served from Pump).
+		if (s.chainCandidates.empty() && f.activatable_cards.empty()) {
+			std::lock_guard<std::mutex> lk(g_chainAnalyzeMutex);
+			if (g_chainAnalyzeCount > 0 && g_chainAnalyzeMsg == s.curMsg) {
+				for (int i = 0; i < g_chainAnalyzeCount; ++i) {
+					const ChainCandRaw& r = g_chainAnalyzeCands[i];
+					ChainCandSnap cs;
+					cs.index = r.seq; // message order == response index
+					cs.code = r.code;
+					cs.name = CardNameOf(cs.code);
+					cs.desc = r.desc;
+					cs.descText = DescTextOf(cs.desc);
+					if (cs.descText.empty()) cs.descText = cs.name.empty() ? "（未知效果）" : (cs.name + " 的效果");
+					cs.forced = (r.flag & 0x100) != 0;
+					cs.isMine = (r.ctrl == mySeat);
+					cs.ctrl = r.ctrl;
+					cs.loc = r.loc;
+					cs.seq = r.seq;
+					cs.summary = std::string(cs.isMine ? "我方" : "对手") + "[" + CardLabel(cs.code, cs.name) + "]" +
+						(cs.descText.empty() ? "" : "（" + cs.descText + "）") + " 可以连锁";
+					cs.summary += cs.forced ? " — 必发" : " — 可选";
+					s.chainCandidates.push_back(std::move(cs));
+				}
+				s.activatable = (int)g_chainAnalyzeCount;
+				Control::Log("CHAIN fallback candidates fromAnalyze=%d curMsg=%d", g_chainAnalyzeCount, s.curMsg);
+			}
+		} else if (s.activatableList.empty() && f.activatable_cards.empty() &&
+			(s.curMsg == MSG_SELECT_IDLECMD || s.curMsg == MSG_SELECT_BATTLECMD)) {
+			// same fallback for the /actions activate list on idle/battle prompts
+			std::lock_guard<std::mutex> lk(g_chainAnalyzeMutex);
+			if (g_chainAnalyzeCount > 0 && g_chainAnalyzeMsg == s.curMsg) {
+				for (int i = 0; i < g_chainAnalyzeCount; ++i) {
+					const ChainCandRaw& r = g_chainAnalyzeCands[i];
+					CandSnap cn;
+					cn.code = r.code;
+					cn.desc = r.desc;
+					cn.ctrl = r.ctrl;
+					cn.loc = r.loc;
+					cn.seq = r.seq;
+					cn.forced = (r.flag & 0x100) != 0;
+					s.activatableList.push_back(std::move(cn));
+				}
+				s.activatable = (int)g_chainAnalyzeCount;
+				Control::Log("CHAIN fallback activatable fromAnalyze=%d curMsg=%d", s.activatable, s.curMsg);
+			}
 		}
 		s.canDecline = !f.chain_forced;
 		// readable hint: SELECT_CHAIN hint (MSG_HINT/HINT_SELECTMSG) if any

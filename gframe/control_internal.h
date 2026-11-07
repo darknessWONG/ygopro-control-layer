@@ -195,6 +195,7 @@ struct Snapshot {
 	int timeLeft{ -1 };
 	size_t lastMsgLen{ 0 };
 	std::string lastMsgHex;
+	std::vector<int> recentMsgs; // last N game-message ids (oldest first)
 };
 
 // control_sem.cpp: one semantic action offered to the LLM for the current prompt.
@@ -206,7 +207,7 @@ struct SemAction {
 	int count{ 1 };
 };
 
-enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu };
+enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave };
 struct Action {
 	ActionKind kind{ ActionKind::None };
 	int32_t i{ 0 };
@@ -242,6 +243,11 @@ struct UiPendingVerify {
 extern std::mutex g_mutex;
 extern std::condition_variable g_cv;
 extern Snapshot g_shared;
+// task-28f: snapshot of the state AT the moment a prompt was published. Later server messages
+// (MSG_WAITING etc.) can overwrite g_shared while the prompt is still awaiting, which made
+// /prompt & /actions report a curMsg that no longer matched the outstanding prompt.
+extern Snapshot g_promptSnap;
+extern std::atomic<bool> g_promptSnapValid;
 extern uint64_t g_seq;
 extern bool g_awaiting;
 extern std::deque<Action> g_actions;
@@ -258,12 +264,15 @@ extern unsigned char g_lastRaw[4096];
 extern size_t g_lastRawLen;
 extern int g_phase;
 extern int g_winPlayer;
+extern int g_winPlayerLocal; // raw winner mapped to local view (0=me, 1=opponent, -1 draw/unknown)
 extern int g_winReason;
 extern bool g_readySent;
 extern std::atomic<bool> g_snapshotWanted;
 extern bool g_promptWanted;
 extern int g_timeLeft;
 extern int g_turnPlayer;
+extern int g_turnPlayerLocal; // g_turnPlayer mapped through LocalPlayer() (0 = me)
+extern std::deque<int> g_msgTrail; // task-28c: recent game-message ids (ranked stall diagnostics)
 extern int g_errMsg;
 extern unsigned g_errCode;
 extern std::vector<unsigned> g_sentMain;
@@ -316,6 +325,80 @@ extern UiPendingVerify g_uiPending;
 extern bool g_uiEventDirect;
 extern std::atomic<bool> g_started;
 
+// task-28h: chain candidates captured on the analyze thread. The client clears
+// dField.activatable_* when the next prompt starts, and the publish-time snapshot can then read an
+// empty list (ranked symptom: 42x CHAIN-DECLINE with zero candidates while LAN works).
+struct ChainCandRaw {
+	unsigned code{ 0 };
+	int desc{ 0 };
+	int flag{ 0 };
+	int ctrl{ 0 }, loc{ 0 }, seq{ 0 };
+};
+extern std::mutex g_chainAnalyzeMutex;
+extern int g_chainAnalyzeCount;   // -1 = nothing captured yet
+extern int g_chainAnalyzeMsg;     // dInfo.curMsg at capture time
+extern int g_chainAnalyzeDepth;   // dField.chains.size()
+extern ChainCandRaw g_chainAnalyzeCands[64];
+extern std::atomic<bool> g_chainCaptureWanted; // capture request set by OnAnalyzeEnd, served in Pump
+void CaptureChainAnalyze();
+// task-28i: detect prompts the client answered by itself during ClientAnalyze (e.g. MSG_SELECT_CHAIN
+// with count==0 auto-sends -1). Publishing those as prompts made policy send duplicate responses,
+// which cascaded into endless empty chain prompts in ranked.
+extern std::atomic<uint64_t> g_ctosAtMsgBegin;
+// task-28k: raw SELECT_CHAIN header (server's own count/specount), used to recognise prompts the
+// client auto-declines (count==0 && specount!=0x7f) even when the CTOS hook misses the response.
+extern std::atomic<int> g_lastChainRawCount;
+extern std::atomic<int> g_lastChainRawSpecount;
+
+// ---------------------------------------------------------------------------
+// task-28: reconnect basics (network liveness + journal + modal suppression)
+// ---------------------------------------------------------------------------
+extern std::atomic<uint64_t> g_lastStocTick;      // any STOC_* arrival (GetTickCount64)
+extern std::atomic<bool> g_netConnected;          // TCP connected
+extern std::atomic<bool> g_netJoined;             // joined a room (CTOS_JOIN_GAME acked)
+extern std::atomic<bool> g_netAlive;              // prober verdict (false = confirmed dead candidate)
+extern std::atomic<int> g_netAliveHits;           // consecutive real STOCs while dead (recovery debounce)
+// task-28: single source of truth for /net.state; /net.alive is derived from it
+enum NetStateCode { NET_STATE_DISCONNECTED = 0, NET_STATE_IDLE = 1, NET_STATE_HEALTHY = 2,
+	NET_STATE_PROBING = 3, NET_STATE_PROBE_FAILED = 4, NET_STATE_UNSUPPORTED = 5, NET_STATE_CONFIRMED_DEAD = 6 };
+extern std::atomic<int> g_netState;
+extern std::atomic<int> g_netProbeFails;          // consecutive failed probes
+extern std::atomic<uint64_t> g_netProbeLastSent;
+extern std::atomic<uint64_t> g_netProbeLastReply;
+extern std::atomic<int> g_netProbeRtt;            // -1 unknown
+extern std::atomic<int> g_netProbeReplyType;      // STOC_CHAT player_type of the last reply
+extern std::atomic<uint64_t> g_netProbePendingSince; // 0 = no probe in flight
+extern std::atomic<uint64_t> g_netProbeForce;     // manual probe request counter (POST /net/probe)
+extern std::atomic<uint64_t> g_netAliveSince;     // last time we saw liveness (5s grace for deaths)
+extern std::atomic<bool> g_netProbeEnabled;       // env YGO_NET_PROBE=0 disables
+extern std::atomic<bool> g_netProbeUnsupported;   // server answered nothing -> passive-only mode
+extern std::atomic<int> g_netProbeRequireSystem;  // env YGO_NET_PROBE_REQUIRE_SYSTEM (default 1)
+extern std::atomic<uint64_t> g_netProbeTrafficTick;
+extern std::atomic<int> g_netProbeIdleMs, g_netProbeGapMs, g_netProbeWindowMs, g_netProbeSilenceMs;
+extern std::atomic<uint64_t> g_lastNetMsgTick;
+extern std::atomic<int> g_lastNetMsgId;
+extern bool g_suppressModals;                     // env YGO_SUPPRESS_MODALS (default on)
+extern bool g_journalEnabled;                     // env YGO_RESUME_JOURNAL (default on)
+extern std::mutex g_netMutex;
+extern std::string g_netCloseReason;
+extern std::string g_netProbeLastText;
+extern std::string g_netLastMsgText;
+extern std::string g_lastRoomAddr;
+extern int g_lastRoomPort;
+extern std::string g_lastRoomPassHash;
+extern int g_controlPort; // journal / resume files are isolated per control port
+// journal: resume context loaded at startup (see bridge/docs/net-probe.md)
+extern bool g_resumePresent;
+extern uint64_t g_resumeSavedAtMs;
+extern long long g_resumeGapMs;
+extern int g_resumeTurn;
+extern int g_resumeSeat;
+extern int g_resumeChainDepth;
+extern std::vector<ChainLinkSnap> g_resumeChainStack;
+extern std::string g_resumeChainingTo;
+extern std::string g_resumePendingPrompt;
+extern std::string g_resumeReason;
+
 // ---------------------------------------------------------------------------
 // Cross-module helpers
 // ---------------------------------------------------------------------------
@@ -349,6 +432,11 @@ void ApplyChainMode(const char* why);
 void UiCleanup(const char* why);
 void CloseEmptyFrames();
 void LogVisibleWindows();
+// task-29a: click an existing widget through the normal GUI event path (same as a human click).
+// void* so this header stays independent of the irrlicht includes; the caller passes an IGUIElement*.
+bool ClickGuiButton(void* widget);
+// task-28d: MSG_CONFIRM_CARDS "view cards" panel blocks the network thread until the OK button is clicked
+bool AutoConfirmBlockingUi();
 
 // control_lobby.cpp
 bool ExecLobbyAction(const Action& a);
@@ -360,6 +448,24 @@ std::string SemActionsJson(const Snapshot& s);
 
 // control.cpp
 std::string RouteRequest(const std::string& path, const std::string& query, std::string& status);
+
+// control.cpp / control_state.cpp (task-28 reconnect basics)
+std::string NetJson();                 // live network state (atomics only, safe from HTTP thread)
+std::string ResumeJson();              // journal snapshot loaded at startup ("null" when absent)
+void JournalPump();                    // called from Pump on the UI thread (rate limited)
+void JournalLoadAtStartup();
+void SetLastRoom(const std::string& addr, int port, const std::string& pass);
+// task-29a: deck errors (local prepare failure / server DECKERROR) exposed via /state.deckError
+void NotifyUserTextImpl(const wchar_t* text, const char* tag);
+void OnDeckErrorImpl(unsigned type, unsigned code, const char* text);
+void SetDeckErrorLocal(const char* reason, unsigned type, unsigned code);
+std::string DeckErrorJson();
+// task-28 network hooks (Control:: wrappers live in control.cpp after `using namespace ctl`)
+void NetOnConnected();
+void NetOnJoined();
+void NetOnDisconnected(const char* reason);
+void NotifyUserImpl(int msgId, const char* tag);
+std::string JsonEscape(const std::string& s); // defined in control_state.cpp
 
 } // namespace ctl
 } // namespace ygo

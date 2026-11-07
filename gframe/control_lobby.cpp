@@ -119,6 +119,43 @@ static bool LoadDeckBySections(const std::string& name) {
 
 
 // ---------------------------------------------------------------------------
+// task-29a: deck combo helpers. The normal prepare flow is "pick the deck in cbDeckSelect,
+// then press ready"; the ready handler loads that deck and sends UpdateDeck + HS_READY.
+// LoadDeckBySections() alone does NOT change the combo selection, so the ranked server could
+// still see the previous/invalid deck.  SyncDeckCombo() selects the real combo entry first.
+// ---------------------------------------------------------------------------
+static std::wstring Utf8ToWide(const std::string& s) {
+	if (s.empty()) return std::wstring();
+	const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+	if (n <= 0) return std::wstring();
+	std::wstring w((size_t)n, L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+	return w;
+}
+
+static bool SyncDeckCombo(const std::string& name) {
+	if (!mainGame || !mainGame->cbCategorySelect || !mainGame->cbDeckSelect || name.empty()) return false;
+	const std::wstring want = Utf8ToWide(name);
+	if (want.empty()) return false;
+	const int cats = (int)mainGame->cbCategorySelect->getItemCount();
+	for (int c = 0; c < cats; ++c) {
+		mainGame->cbCategorySelect->setSelected(c);
+		mainGame->RefreshCategoryDeck(mainGame->cbCategorySelect, mainGame->cbDeckSelect);
+		const int decks = mainGame->cbDeckSelect ? (int)mainGame->cbDeckSelect->getItemCount() : 0;
+		for (int i = 0; i < decks; ++i) {
+			const wchar_t* item = mainGame->cbDeckSelect->getItem((irr::u32)i);
+			if (item && want == item) {
+				mainGame->cbDeckSelect->setSelected(i);
+				Control::Log("deck: select combo name=%s cat=%d deck=%d -> confirmed", name.c_str(), c, i);
+				return true;
+			}
+		}
+	}
+	Control::Log("deck: select combo name=%s -> NOT FOUND in %d categories", name.c_str(), cats);
+	return false;
+}
+
+// ---------------------------------------------------------------------------
 // Execute one lobby/deck action (Ready / Deck / Surrender / Start / NotReady / Join).
 // Verbatim move of the former ExecuteAction cases; none of them is UI-handled.
 // ---------------------------------------------------------------------------
@@ -130,6 +167,22 @@ bool ExecLobbyAction(const Action& a) {
 		if (!DuelClient::IsConnected()) {
 			Control::Log("ready: skipped, not connected");
 			break;
+		}
+		// task-29a: if the prepare window is up, do what a human does: select the deck combo, then
+		// press the real ready button (its handler loads the deck and sends UpdateDeck + HS_READY).
+		if (mainGame->btnHostPrepReady && mainGame->btnHostPrepReady->isVisible() &&
+			mainGame->cbCategorySelect && mainGame->cbDeckSelect) {
+			if (!g_selectedDeck.empty()) SyncDeckCombo(g_selectedDeck);
+			const int catSel = (int)mainGame->cbCategorySelect->getSelected();
+			const int deckSel = (int)mainGame->cbDeckSelect->getSelected();
+			if (catSel >= 0 && deckSel >= 0) {
+				Control::Log("ready: clicking HP_READY via UI (cat=%d deck=%d)", catSel, deckSel);
+				ClickGuiButton(mainGame->btnHostPrepReady);
+				g_readySent = true;
+				break;
+			}
+			SetDeckErrorLocal("deck-combo-not-selected", 0, 0);
+			Control::Log("ready: combos not selected (cat=%d deck=%d) -> fallback direct load", catSel, deckSel);
 		}
 		// Mirror the UI's ready button, but tolerate widgets that do not exist yet (e.g. the
 		// guest never opened the room screen -> combo boxes are empty / getText() can be null).
@@ -196,9 +249,15 @@ bool ExecLobbyAction(const Action& a) {
 		if (ok) {
 			wcsncpy(mainGame->gameConf.lastdeck, w.c_str(), 19);
 			mainGame->gameConf.lastdeck[19] = 0;
-			std::lock_guard<std::mutex> lk(g_mutex);
-			g_deckMain = (int)deckManager.current_deck.main.size();
-			g_deckExtra = (int)deckManager.current_deck.extra.size();
+			// task-29a: also select the real combo entry (this is what the prepare UI/servers read)
+			if (!SyncDeckCombo(a.deckName)) {
+				Control::Log("deck: combo sync failed for '%s' (deck loaded into memory only)", a.deckName.c_str());
+			}
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				g_deckMain = (int)deckManager.current_deck.main.size();
+				g_deckExtra = (int)deckManager.current_deck.extra.size();
+			}
 		}
 		break;
 	}
@@ -245,6 +304,7 @@ bool ExecLobbyAction(const Action& a) {
 			if (mainGame->ebJoinPass) mainGame->ebJoinPass->setText(w.c_str());
 		}
 		Control::Log("join: host=%s port=%d passlen=%d", a.ip.c_str(), a.port, (int)a.pass.size());
+		SetLastRoom(a.ip, a.port, a.pass); // task-28: remember the room for the resume journal
 		unsigned int ip = inet_addr(a.ip.c_str());
 		if (ip == INADDR_NONE) {
 			// hostname (e.g. tiramisu.moenext.com) -> resolve to IPv4 first
@@ -261,7 +321,43 @@ bool ExecLobbyAction(const Action& a) {
 		// StartClient expects HOST byte order (it does htonl internally), inet_addr/getaddrinfo give network order
 		ip = ntohl(ip);
 		Control::Log("join: startClient ip=0x%08x", ip);
-		DuelClient::StartClient(ip, (unsigned short)a.port, false);
+		const bool started = DuelClient::StartClient(ip, (unsigned short)a.port, false);
+		// The normal UI flow enters LAN mode first (hides wMainMenu, shows wLanWindow); the control
+		// layer jumps straight to StartClient, so hide the main menu / LAN window here as well or
+		// they stay stacked over the duel board after a reconnect (observed in the ranked test).
+		if (started) {
+			if (mainGame->wMainMenu && mainGame->wMainMenu->isVisible()) {
+				mainGame->HideElement(mainGame->wMainMenu);
+				Control::Log("join: hid wMainMenu (control-layer join)");
+			}
+			if (mainGame->wLanWindow && mainGame->wLanWindow->isVisible()) {
+				mainGame->HideElement(mainGame->wLanWindow);
+				Control::Log("join: hid wLanWindow (control-layer join)");
+			}
+		}
+		break;
+	}
+	case ActionKind::Leave: {
+		// task-28: cleanly leave the current room and return to the main menu (used by supervisor
+		// before it restarts the client).  Best effort on the widgets: some may not exist yet.
+		Control::Log("leave: StopClient(EXIT) + reset dInfo");
+		if (mainGame) {
+			auto hide = [](irr::gui::IGUIWindow* w) {
+				if (w && w->isVisible()) mainGame->HideElement(w);
+			};
+			hide(mainGame->wPosSelect);
+			hide(mainGame->wOptions);
+			hide(mainGame->wCardSelect);
+			hide(mainGame->wCmdMenu);
+			hide(mainGame->wMessage);
+			hide(mainGame->wQuery);
+			mainGame->dInfo.isStarted = false;
+			mainGame->dInfo.isInDuel = false;
+			mainGame->dInfo.isFinished = false;
+			mainGame->is_building = false;
+			if (mainGame->device) mainGame->device->setEventReceiver(&mainGame->menuHandler);
+		}
+		if (DuelClient::IsConnected()) DuelClient::StopClient(CLIENT_CLOSE_REASON_EXIT);
 		break;
 	}
 	default:
