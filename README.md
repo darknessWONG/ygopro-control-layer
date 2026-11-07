@@ -1,3 +1,7 @@
+> **本仓库是 [mycard/ygopro](https://github.com/mycard/ygopro) 的 fork**，新增了一层进程内 **AI 控制层**（HTTP/JSON），供 LLM / agent 通过 MCP 打牌。
+> 说明见 [`AI-CONTROL.md`](AI-CONTROL.md)；上游基线与改动清单见 [`UPSTREAM.md`](UPSTREAM.md)；依赖许可见 [`THIRD-PARTY.md`](THIRD-PARTY.md)。
+> 配套桥接层（MCP server / 策略 / 工具）：`ygopro-mcp`（独立仓库，MIT）。
+
 ## YGOPro
 [![Build Status](https://travis-ci.org/moecube/ygopro.svg?branch=master)](https://travis-ci.org/moecube/ygopro) [![Build status](https://ci.appveyor.com/api/projects/status/qgkqi6o0wq7qn922?svg=true)](https://ci.appveyor.com/project/zh99998/ygopro)
 
