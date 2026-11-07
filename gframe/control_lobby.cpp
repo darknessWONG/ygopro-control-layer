@@ -261,6 +261,20 @@ bool ExecLobbyAction(const Action& a) {
 		}
 		break;
 	}
+	case ActionKind::Tp: {
+		// task-34: send the LLM-chosen first/second result (1=first, 2=second)
+		if (!DuelClient::IsConnected()) {
+			Control::Log("tp: skipped, not connected");
+			break;
+		}
+		int res = a.i;
+		if (res != 1 && res != 2) res = 2;
+		CTOS_TPResult pkt;
+		pkt.res = (unsigned char)res;
+		DuelClient::SendPacketToServer(CTOS_TP_RESULT, pkt);
+		Control::Log("TP choice res=%d (from control)", res);
+		break;
+	}
 	case ActionKind::Surrender:
 		if (!DuelClient::IsConnected()) {
 			Control::Log("surrender: skipped, not connected");

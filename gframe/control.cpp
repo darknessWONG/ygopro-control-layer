@@ -485,6 +485,10 @@ bool g_suppressModals{ true };
 bool g_journalEnabled{ true };
 std::mutex g_netMutex;
 std::string g_netCloseReason{ "none" };
+// task-34: TP exposure (see control_internal.h)
+std::atomic<bool> g_controlDriven{ false };
+std::atomic<bool> g_tpPending{ false };
+std::atomic<bool> g_tpPromptActive{ false };
 // task-28h: chain-candidate capture (definitions; see control_internal.h)
 std::mutex g_chainAnalyzeMutex;
 int g_chainAnalyzeCount{ -1 };
@@ -1163,6 +1167,9 @@ std::string DeckErrorJson() {
 // RouteRequest: the HTTP endpoint table (see bridge/docs/MCP-INTERFACE.md)
 // ---------------------------------------------------------------------------
 std::string RouteRequest(const std::string& path, const std::string& query, std::string& status) {
+	// task-34: any HTTP request means the control layer is driven by MCP; only then does TP become
+	// an LLM decision (manual play keeps the legacy auto-send in AutoTpResult).
+	g_controlDriven.store(true);
 	std::string body;
 	if (path == "/health") {
 			body = g_started.load() ? "{\"ok\":true,\"started\":true}" : "{\"ok\":true,\"started\":false}";
@@ -1220,7 +1227,15 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			body = PromptJson(g_awaiting && g_promptSnapValid.load() ? g_promptSnap : g_shared);
 		} else if (path == "/actions") {
 			std::lock_guard<std::mutex> lk(g_mutex);
-			if (!g_awaiting) {
+			if (g_tpPromptActive.load()) {
+				// task-34: first/second choice; index 1 = first (res=1), index 2 = second (res=2)
+				std::ostringstream ost;
+				ost << "{\"actions\":[{\"id\":0,\"kind\":\"tp\",\"label\":\"tp first (index=1)\",\"index\":1},"
+				    << "{\"id\":1,\"kind\":\"tp\",\"label\":\"tp second (index=2)\",\"index\":2}],"
+				    << "\"awaiting\":true,\"tpPending\":true,\"curMsg\":" << g_promptSnap.curMsg
+				    << ",\"seq\":" << (unsigned long long)g_seq << '}';
+				body = ost.str();
+			} else if (!g_awaiting) {
 				// task-28c: never advertise an action when no prompt is pending. The old "auto"
 				// fallback made policy clients spam unsolicited responses during MSG_WAITING.
 				std::ostringstream os2;
@@ -1232,6 +1247,26 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 				body = SemActionsJson(g_promptSnapValid.load() ? g_promptSnap : g_shared);
 			}
 		} else if (path == "/act_id") {
+			if (g_tpPromptActive.load()) {
+				// task-34: the pending "tp" choice; id 0 = first (res=1), id 1 = second (res=2)
+				const int id = atoi(QueryParam(query, "id").c_str());
+				if (id != 0 && id != 1) {
+					body = "{\"ok\":false,\"error\":\"bad tp id (0=first, 1=second)\"}";
+					return body;
+				}
+				const int res = (id == 0) ? 1 : 2;
+				{
+					std::lock_guard<std::mutex> lk(g_mutex);
+					Action a;
+					a.kind = ActionKind::Tp;
+					a.i = res;
+					g_actions.push_back(std::move(a));
+					g_tpPromptActive.store(false);
+					g_tpPending.store(false);
+					g_awaiting = false;
+				}
+				body = "{\"ok\":true,\"queued\":true,\"kind\":\"tp\",\"index\":" + std::to_string(res) + "}";
+			} else {
 			int id = atoi(QueryParam(query, "id").c_str());
 			Action act;
 			std::string err;
@@ -1264,6 +1299,7 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			}
 			if (!ok) { body = "{\"ok\":false,\"error\":\"" + err + "\"}"; }
 			else { body = "{\"ok\":true,\"queued\":true}"; }
+			} // task-34: end of non-tp /act_id branch
 		} else if (path == "/wait_prompt") {
 			uint64_t since = (uint64_t)atoll(QueryParam(query, "since").c_str());
 			int timeout = atoi(QueryParam(query, "timeout_ms").c_str());
@@ -1674,16 +1710,37 @@ bool Control::AutoHandResult() {
 }
 
 bool Control::AutoTpResult() {
+	// task-34: when the control layer is driven by MCP, do NOT answer TP here.  Publish a prompt
+	// and send CTOS_TP_RESULT only after /act_id (kind=tp).  Manual play keeps the old behaviour;
+	// YGO_TP still force-overrides both.
 	const char* env = std::getenv("YGO_TP");
-	int res = env ? std::atoi(env) : 2;
-	if (res != 1 && res != 2) res = 2;
+	if (env && *env) {
+		int res = std::atoi(env);
+		if (res != 1 && res != 2) res = 2;
+		CTOS_TPResult pkt;
+		pkt.res = (unsigned char)res;
+		DuelClient::SendPacketToServer(CTOS_TP_RESULT, pkt);
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			g_stocRing.push_back(2000 + res);
+		}
+		Control::Log("TP choice res=%d (forced by YGO_TP)", res);
+		return true;
+	}
+	if (g_controlDriven.load()) {
+		g_tpPending.store(true);
+		Control::Log("TP pending: waiting for LLM choice (control-driven, no auto-send)");
+		return true; // swallow the native UI; Pump publishes the prompt
+	}
+	// manual play: unchanged legacy default (second)
 	CTOS_TPResult pkt;
-	pkt.res = (unsigned char)res;
+	pkt.res = 2;
 	DuelClient::SendPacketToServer(CTOS_TP_RESULT, pkt);
 	{
 		std::lock_guard<std::mutex> lk(g_mutex);
-		g_stocRing.push_back(2000 + res);
+		g_stocRing.push_back(2002);
 	}
+	Control::Log("TP choice res=2 (manual default)");
 	return true;
 }
 void Control::Log(const char* fmt, ...) {
@@ -2020,6 +2077,22 @@ void Control::Pump() {
 					(unsigned long long)g_seq, g_shared.chainDepth, g_shared.chainCandidates.size(),
 					g_chainAnalyzeCount);
 			}
+			g_cv.notify_all();
+		}
+	}
+	// task-34: STOC_SELECT_TP arrived while control-driven -> publish a synthetic "tp" prompt.
+	// It is not a MSG prompt, so it has its own publish path; g_awaiting/g_promptSnap make it
+	// behave exactly like a normal prompt (/prompt is frozen, /actions gives the two choices).
+	if (g_tpPending.load() && !g_tpPromptActive.load()) {
+		std::lock_guard<std::mutex> lk(g_mutex);
+		if (!g_awaiting) {
+			g_tpPromptActive.store(true);
+			++g_seq;
+			g_awaiting = true;
+			g_promptSnap = g_shared; // current field/hand state; tp has no per-prompt list
+			g_promptSnapValid.store(true);
+			Control::Log("PROMPT publish seq=%llu msg=TP turn=%d tpPending=1 tpOptions=[1,2]",
+				(unsigned long long)g_seq, g_shared.turn);
 			g_cv.notify_all();
 		}
 	}

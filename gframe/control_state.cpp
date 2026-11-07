@@ -226,8 +226,12 @@ void AppendCands(std::ostringstream& os, const std::vector<CandSnap>& v) {
 std::string PromptJson(const Snapshot& s) {
 	std::ostringstream os;
 	os << "{\"seq\":" << g_seq << ",\"curMsg\":" << s.curMsg << ",\"turn\":" << s.turn
-	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false")
-	   << ",\"summonable\":" << s.summonable
+	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false");
+	// task-34: first/second choice is exposed as its own prompt
+	if (g_tpPromptActive.load()) {
+		os << ",\"tpPending\":true,\"tpOptions\":[1,2],\"tpChooseBy\":\"act_id kind=tp index=1|2\"";
+	}
+	os << ",\"summonable\":" << s.summonable
 	   << ",\"spsummonable\":" << s.spsummonable
 	   << ",\"msetable\":" << s.msetable
 	   << ",\"ssetable\":" << s.ssetable

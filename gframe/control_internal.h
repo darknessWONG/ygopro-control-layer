@@ -207,7 +207,13 @@ struct SemAction {
 	int count{ 1 };
 };
 
-enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave };
+// task-34: TP (first/second) is chosen by the MCP client when the control layer is driven.
+// g_controlDriven becomes true after the first HTTP request; AutoTpResult() then publishes a
+// "tp" prompt instead of sending CTOS_TP_RESULT.  Manual play keeps the legacy auto-send.
+extern std::atomic<bool> g_controlDriven;
+extern std::atomic<bool> g_tpPending;      // STOC_SELECT_TP seen, waiting for /act_id
+extern std::atomic<bool> g_tpPromptActive; // synthetic tp prompt published and awaiting
+enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave, Tp };
 struct Action {
 	ActionKind kind{ ActionKind::None };
 	int32_t i{ 0 };
