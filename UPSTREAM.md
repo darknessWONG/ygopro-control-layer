@@ -9,7 +9,7 @@
 | 许可 | GPLv2（见 `LICENSE`，未做修改） |
 | 本仓库角色 | fork，**只新增控制层与接入钩子**，未修改游戏规则/协议/资源 |
 
-> 上游另有原始项目（Fluorohydride/ygopro、ProjectIgnis/edopro 等），本 fork 基于 MyCard 的客户端分支。
+> 上游另有原始项目（Fluorohydride/ygopro、ProjectIgnis/edopro 等），本 fork 基于 MyCard 的客户端分支。README.upstream.md 保留了上游原始 README。
 
 ## 新增文件（控制层）
 
