@@ -116,7 +116,7 @@ curl.exe http://127.0.0.1:7788/state       # 完整局面
 | 房间 | `/join?ip=&port=&pass=` `/deck?name=` `/ready` `/start` `/leave` `/surrender` |
 | 排障 | `/net/probe` `/uiclick` `/ctos` `/hs` |
 
-完整字段与语义动作说明见 `AI-CONTROL.md`；面向 LLM 的权威接口规范在配套仓库的 `docs/MCP-INTERFACE.md`。
+每个端点的完整字段、动作编码和流程示例见 [`docs/CONTROL-API.md`](docs/CONTROL-API.md)；面向 LLM 的 MCP 接口规范在配套仓库 [ygopro-mcp](https://github.com/darknessWONG/ygopro-mcp) 的 `docs/MCP-INTERFACE.md`。
 
 ---
 
@@ -126,9 +126,10 @@ curl.exe http://127.0.0.1:7788/state       # 完整局面
 |---|---|
 | `gframe/control*.cpp` / `control*.h` | 控制层本体（8 个文件，约 4,950 行） |
 | `gframe/duelclient.cpp` 等 6 个上游文件 | 只加了入口钩子（约 60 行） |
-| `AI-CONTROL.md` | 控制层详细说明（接口一览、环境变量、状态） |
+| `docs/CONTROL-API.md` | **HTTP 层完整 API 文档**（每个端点/字段/动作编码/完整流程示例） |
+| `AI-CONTROL.md` | 控制层概览（架构、能力、环境变量、状态） |
 | `UPSTREAM.md` | 上游基线、改动清单、如何与上游同步 |
-| `THIRD-PARTY.md` | 依赖许可表 |
+
 | `README.upstream.md` | 上游 ygopro 的原始 README（保留备查） |
 
 ---

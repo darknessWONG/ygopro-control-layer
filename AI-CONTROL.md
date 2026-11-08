@@ -42,7 +42,7 @@ LLM / agent（MCP 宿主）
 
 语义动作（`/actions` 的 `kind`）覆盖：召唤/特召/盖放/发动/攻击/战阶切换/位置/放卡/选卡/选连锁/是否/选项/结束阶段等。LLM 只需要「读状态 → 选动作 id」，编码与 UI 执行都在客户端内完成。
 
-详细字段与行为见配套仓库 **ygopro-mcp** 的 `docs/MCP-INTERFACE.md`。
+本仓库 HTTP 层完整用法（每个端点/字段/动作编码/完整流程）见 [docs/CONTROL-API.md](docs/CONTROL-API.md)；MCP 工具层见配套仓库 [ygopro-mcp](https://github.com/darknessWONG/ygopro-mcp) 的 docs/MCP-INTERFACE.md。
 
 ---
 
@@ -144,4 +144,4 @@ curl.exe http://127.0.0.1:7788/health
 
 本仓库是 GPLv2 的派生作品，**整体按 GPLv2 发布**（见 `LICENSE`）。分发编译后的可执行文件时，必须同时提供完整对应源码。
 
-**本仓库不包含**：卡牌图片、`cards.cdb`、卡组、对局录像等资源（这些不属于上游开源部分，也请勿自行打包分发）。依赖库许可见 `THIRD-PARTY.md`，上游信息见 `UPSTREAM.md`。
+**本仓库不包含**：卡牌图片、`cards.cdb`、卡组、对局录像等资源（这些不属于上游开源部分，也请勿自行打包分发）。依赖库许可见各子目录的 LICENSE 文件（`ocgcore/LICENSE`、`irrlicht/` 等）；上游信息见 `UPSTREAM.md`。
