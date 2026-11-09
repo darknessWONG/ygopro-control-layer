@@ -57,6 +57,9 @@ public:
 	static void NotifyUserText(const wchar_t* text, const char* tag);
 	// task-29a: remember a server-side deck error (DECKERROR_*) for /state.deckError
 	static void OnDeckError(unsigned type, unsigned code, const char* text);
+	// task-35: Bo3 side-decking state (STOC_CHANGE_SIDE / STOC_WAITING_SIDE)
+	static void OnChangeSide();
+	static void OnWaitingSide();
 	// record HS player-change status bytes (pos<<4 | state, state 9=READY 10=NOTREADY)
 	static void OnHsChange(unsigned char status);
 	// append a line to control.log (crash / flow diagnostics)

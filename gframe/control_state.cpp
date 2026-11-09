@@ -231,6 +231,10 @@ std::string PromptJson(const Snapshot& s) {
 	if (g_tpPromptActive.load()) {
 		os << ",\"tpPending\":true,\"tpOptions\":[1,2],\"tpChooseBy\":\"act_id kind=tp index=1|2\"";
 	}
+	// task-35: Bo3 side decking prompt
+	if (g_sidePromptActive.load()) {
+		os << ",\"sidePending\":true,\"sideChooseBy\":\"act_id kind=side_ok id=0\"";
+	}
 	os << ",\"summonable\":" << s.summonable
 	   << ",\"spsummonable\":" << s.spsummonable
 	   << ",\"msetable\":" << s.msetable
@@ -384,6 +388,8 @@ std::string SnapshotJson(const Snapshot& s) {
 	   << ",\"deckExtra\":" << g_deckExtra
 	   << ",\"seq\":" << g_seq
 	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false")
+	   // task-35: true while STOC_CHANGE_SIDE is pending (or its synthetic prompt is awaiting)
+	   << ",\"sidePending\":" << ((g_sidePending.load() || g_sidePromptActive.load()) ? "true" : "false")
 	   << ",\"lastMsg\":{\"id\":" << s.lastMsgId << ",\"len\":" << s.lastMsgLen
 	   << ",\"hex\":\"" << s.lastMsgHex << "\"}";
 	os << ",\"counts\":{\"hand\":[" << s.hand[0].size() << ',' << s.hand[1].size() << ']'

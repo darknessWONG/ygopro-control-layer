@@ -114,6 +114,8 @@ bool ExecuteAction(const Action& a) {
 	case ActionKind::Join:
 	case ActionKind::Leave:
 	case ActionKind::Tp:
+	case ActionKind::SideOk:
+	case ActionKind::HostOpts:
 		return ExecLobbyAction(a);
 	case ActionKind::Int32:
 		// Log the exact bytes we hand back: when the server answers MSG_RETRY, this line

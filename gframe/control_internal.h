@@ -213,7 +213,11 @@ struct SemAction {
 extern std::atomic<bool> g_controlDriven;
 extern std::atomic<bool> g_tpPending;      // STOC_SELECT_TP seen, waiting for /act_id
 extern std::atomic<bool> g_tpPromptActive; // synthetic tp prompt published and awaiting
-enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave, Tp };
+// task-35: Bo3 side decking. STOC_CHANGE_SIDE opens the siding UI; when control-driven we do not
+// click btnSideOK automatically but publish a synthetic prompt (kind "side_ok") for the LLM.
+extern std::atomic<bool> g_sidePending;      // STOC_CHANGE_SIDE seen, waiting for /act_id
+extern std::atomic<bool> g_sidePromptActive; // synthetic side prompt published and awaiting
+enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave, Tp, SideOk, HostOpts };
 struct Action {
 	ActionKind kind{ ActionKind::None };
 	int32_t i{ 0 };

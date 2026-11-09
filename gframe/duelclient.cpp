@@ -196,6 +196,10 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 				cscg.info.no_check_deck = mainGame->chkNoCheckDeck->isChecked();
 				cscg.info.no_shuffle_deck = mainGame->chkNoShuffleDeck->isChecked();
 			}
+			// task-35d: prove the match-mode bit actually goes to the server
+			Control::Log("StartClient create: match=%d rule=%d startLP=%d draw=%d timeLimit=%d",
+				(int)cscg.info.mode, (int)cscg.info.rule, (int)cscg.info.start_lp,
+				(int)cscg.info.draw_count, (int)cscg.info.time_limit);
 			SendPacketToServer(CTOS_CREATE_GAME, cscg);
 		} else {
 			CTOS_JoinGame csjg;
@@ -479,6 +483,8 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		mainGame->deckBuilder.pre_sidec = deckManager.current_deck.side.size();
 		mainGame->device->setEventReceiver(&mainGame->deckBuilder);
 		mainGame->gMutex.unlock();
+		// task-35: Bo3 side decking; control-driven runs publish a synthetic "side" prompt
+		Control::OnChangeSide();
 		break;
 	}
 	case STOC_WAITING_SIDE: {
@@ -488,6 +494,8 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		mainGame->stHintMsg->setText(dataManager.GetSysString(1409));
 		mainGame->stHintMsg->setVisible(true);
 		mainGame->gMutex.unlock();
+		// task-35: opponent is still siding -> no action for us, just release the side prompt
+		Control::OnWaitingSide();
 		break;
 	}
 	case STOC_DECK_COUNT: {

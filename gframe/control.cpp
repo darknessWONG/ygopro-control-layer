@@ -489,6 +489,9 @@ std::string g_netCloseReason{ "none" };
 std::atomic<bool> g_controlDriven{ false };
 std::atomic<bool> g_tpPending{ false };
 std::atomic<bool> g_tpPromptActive{ false };
+// task-35: Bo3 side decking (see control_internal.h)
+std::atomic<bool> g_sidePending{ false };
+std::atomic<bool> g_sidePromptActive{ false };
 // task-28h: chain-candidate capture (definitions; see control_internal.h)
 std::mutex g_chainAnalyzeMutex;
 int g_chainAnalyzeCount{ -1 };
@@ -1099,6 +1102,34 @@ void NotifyUserImpl(int msgId, const char* tag) {
 	mainGame->env->addMessageBox(L"", wtext ? wtext : L"");
 }
 
+// task-35: Bo3 side decking hooks (called from DuelClient STOC handlers)
+void OnChangeSideImpl() {
+	// task-35d: always log arrival (manual or driven) so LAN/ranked Bo3 can be diagnosed
+	Control::Log("STOC_CHANGE_SIDE received (controlDriven=%d)", g_controlDriven.load() ? 1 : 0);
+	if (!g_controlDriven.load()) return; // manual play keeps the original siding UI
+	g_sidePending.store(true);
+	Control::Log("SIDE pending: waiting for LLM side_ok (control-driven, no auto-click)");
+}
+
+void OnWaitingSideImpl() {
+	// task-35d: always log arrival
+	Control::Log("STOC_WAITING_SIDE received (controlDriven=%d)", g_controlDriven.load() ? 1 : 0);
+	// the server is waiting for the opponent; no action to publish, just release a side prompt
+	const bool hadPrompt = g_sidePromptActive.load();
+	g_sidePending.store(false);
+	g_sidePromptActive.store(false);
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		if (hadPrompt && g_awaiting) {
+			g_awaiting = false;
+			g_promptSnapValid.store(false);
+		}
+	}
+	g_cv.notify_all();
+	Control::Log("SIDE waiting for opponent%s", hadPrompt ? " (side prompt released)" : "");
+}
+
+
 // task-29a: deck errors (see control_internal.h)
 static std::mutex g_deckMutex;
 static std::string g_deckErrLocalText;
@@ -1227,7 +1258,15 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			body = PromptJson(g_awaiting && g_promptSnapValid.load() ? g_promptSnap : g_shared);
 		} else if (path == "/actions") {
 			std::lock_guard<std::mutex> lk(g_mutex);
-			if (g_tpPromptActive.load()) {
+			if (g_sidePromptActive.load()) {
+				// task-35: Bo3 side decking — keep the side deck unchanged and continue
+				std::ostringstream oss;
+				oss << "{\"actions\":[{\"id\":0,\"kind\":\"side_ok\","
+				    << "\"label\":\"keep side deck (no changes) and continue\"}],"
+				    << "\"awaiting\":true,\"sidePending\":true,\"curMsg\":" << g_promptSnap.curMsg
+				    << ",\"seq\":" << (unsigned long long)g_seq << '}';
+				body = oss.str();
+			} else if (g_tpPromptActive.load()) {
 				// task-34: first/second choice; index 1 = first (res=1), index 2 = second (res=2)
 				std::ostringstream ost;
 				ost << "{\"actions\":[{\"id\":0,\"kind\":\"tp\",\"label\":\"tp first (index=1)\",\"index\":1},"
@@ -1247,7 +1286,24 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 				body = SemActionsJson(g_promptSnapValid.load() ? g_promptSnap : g_shared);
 			}
 		} else if (path == "/act_id") {
-			if (g_tpPromptActive.load()) {
+			if (g_sidePromptActive.load()) {
+				// task-35: only one side action (id 0 = keep side deck + continue)
+				const int id = atoi(QueryParam(query, "id").c_str());
+				if (id != 0) {
+					body = "{\"ok\":false,\"error\":\"bad side id (only 0=side_ok)\"}";
+					return body;
+				}
+				{
+					std::lock_guard<std::mutex> lk(g_mutex);
+					Action a;
+					a.kind = ActionKind::SideOk;
+					g_actions.push_back(std::move(a));
+					g_sidePromptActive.store(false);
+					g_sidePending.store(false);
+					g_awaiting = false;
+				}
+				body = "{\"ok\":true,\"queued\":true,\"kind\":\"side_ok\"}";
+			} else if (g_tpPromptActive.load()) {
 				// task-34: the pending "tp" choice; id 0 = first (res=1), id 1 = second (res=2)
 				const int id = atoi(QueryParam(query, "id").c_str());
 				if (id != 0 && id != 1) {
@@ -1488,6 +1544,39 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			   << ",\"fails\":" << g_netProbeFails.load()
 			   << ",\"lastReplyPlayerType\":" << g_netProbeReplyType.load() << '}';
 			body = os.str();
+		} else if (path == "/hostopts") {
+			// task-35: LAN Bo3 testing helper. match=<0|1|2> selects cbMatchMode
+			// (0=Single, 1=Match, 2=Tag per the client combo); applied on the Pump UI thread.
+			int m = atoi(QueryParam(query, "match").c_str());
+			if (QueryParam(query, "match").empty()) m = 1;
+			if (m < 0 || m > 2) m = 1;
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				Action a;
+				a.kind = ActionKind::HostOpts;
+				a.i = m;
+				a.port = 0; // combo only
+				g_actions.push_back(std::move(a));
+			}
+			body = "{\"ok\":true,\"queued\":true,\"matchMode\":" + std::to_string(m) + "}";
+		} else if (path == "/host") {
+			// task-35: create a LAN room from the control layer (same path as `-c`), with the
+			// match mode selected first; enables Bo3 reproduction without relaunching the client.
+			int m = atoi(QueryParam(query, "match").c_str());
+			if (QueryParam(query, "match").empty()) m = 1;
+			if (m < 0 || m > 2) m = 1;
+			int port = atoi(QueryParam(query, "port").c_str());
+			if (port <= 0) port = 7911;
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				Action a;
+				a.kind = ActionKind::HostOpts;
+				a.i = m;
+				a.port = port;
+				g_actions.push_back(std::move(a));
+			}
+			body = "{\"ok\":true,\"queued\":true,\"matchMode\":" + std::to_string(m) +
+				",\"port\":" + std::to_string(port) + "}";
 		} else if (path == "/leave") {
 			// task-28: cleanly leave the current room and return to the main menu
 			{
@@ -1546,6 +1635,8 @@ void Control::OnNetDisconnected(const char* reason) { ctl::NetOnDisconnected(rea
 void Control::NotifyUser(int msgId, const char* tag) { ctl::NotifyUserImpl(msgId, tag); }
 void Control::NotifyUserText(const wchar_t* text, const char* tag) { ctl::NotifyUserTextImpl(text, tag); }
 void Control::OnDeckError(unsigned type, unsigned code, const char* text) { ctl::OnDeckErrorImpl(type, code, text); }
+void Control::OnChangeSide() { ctl::OnChangeSideImpl(); }
+void Control::OnWaitingSide() { ctl::OnWaitingSideImpl(); }
 
 void Control::EnsureStarted() {
 	static std::once_flag once;
@@ -2056,6 +2147,21 @@ void Control::Pump() {
 		g_dismissUntilTick.store(GetTickCount64() + 2000);
 	}
 	AutoDismissPump();
+	// task-35e: STOC_REPLAY shows the "save replay?" dialog and then BLOCKS the network thread on
+	// replaySignal.Wait() when auto-save is off.  Everything sent after it (STOC_CHANGE_SIDE in
+	// Bo3, STOC_DUEL_END in single) is then never processed.  In control-driven mode skip the save.
+	// (gated to once per second so a stuck dialog cannot spam the log every frame)
+	{
+		static uint64_t lastReplaySkipTick = 0;
+		const uint64_t replayTick = GetTickCount64();
+		if (g_controlDriven.load() && mainGame->wReplaySave && mainGame->wReplaySave->isVisible() &&
+			mainGame->btnRSNo && replayTick - lastReplaySkipTick >= 1000) {
+			lastReplaySkipTick = replayTick;
+			Control::Log("UI auto-confirm kind=replay-save (skip save) curMsg=%d",
+				(int)mainGame->dInfo.curMsg);
+			ClickGuiButton(mainGame->btnRSNo);
+		}
+	}
 	if (g_chainCaptureWanted.exchange(false)) CaptureChainAnalyze();
 	if (g_snapshotWanted.exchange(false)) {
 		Snapshot s;
@@ -2093,6 +2199,21 @@ void Control::Pump() {
 			g_promptSnapValid.store(true);
 			Control::Log("PROMPT publish seq=%llu msg=TP turn=%d tpPending=1 tpOptions=[1,2]",
 				(unsigned long long)g_seq, g_shared.turn);
+			g_cv.notify_all();
+		}
+	}
+	// task-35: Bo3 side decking — STOC_CHANGE_SIDE arrived while control-driven -> publish a
+	// synthetic "side" prompt (same frozen-snapshot mechanism as tp).
+	if (g_sidePending.load() && !g_sidePromptActive.load()) {
+		std::lock_guard<std::mutex> lk(g_mutex);
+		if (!g_awaiting) {
+			g_sidePromptActive.store(true);
+			++g_seq;
+			g_awaiting = true;
+			g_promptSnap = g_shared;
+			g_promptSnapValid.store(true);
+			Control::Log("PROMPT publish seq=%llu msg=SIDE sidePending=1",
+				(unsigned long long)g_seq);
 			g_cv.notify_all();
 		}
 	}

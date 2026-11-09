@@ -192,6 +192,25 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=2"
 - 纯手动（从未有 HTTP 请求）：保持旧行为自动选后攻（`res=2`），不出现 tp prompt；
 - `YGO_TP=1|2` 强制覆盖（`TP choice res=N (forced by YGO_TP)`）。
 
+### 3.5.1 换备牌（Bo3，`kind:"side_ok"`）
+
+Bo3 的 `Game1 → Game2` 之间服务端会发 `STOC_CHANGE_SIDE`（进 siding 界面，显示 `btnSideOK` 等）。
+控制层被 HTTP 驱动时：
+
+- `/state.sidePending:true`；`/prompt` 出现 `sidePending:true`（`seq++`，与普通 prompt 一样冻结）；
+- `/actions` 返回一条：
+  ```json
+  {"actions":[{"id":0,"kind":"side_ok","label":"keep side deck (no changes) and continue"}],
+   "awaiting":true,"sidePending":true}
+  ```
+- `/act_id?id=0` → 在 UI 线程点击真实 `btnSideOK`（客户端自己的 `BUTTON_SIDE_OK` handler：校验
+  main/extra/side 数量不变 → `SendUpdateDeck`），日志 `SIDE ok clicked (from control)`；
+  随后服务端 `STOC_WAITING_SIDE`（等对手）会清掉 pending，下一局重新 `/ready` 即可。
+- 纯手动（从未有 HTTP 请求）不发布该 prompt，原 siding UI 行为不变。
+- **重要**：每局结束服务端会发 `STOC_REPLAY`（回放），若客户端"自动保存回放"未勾选会弹保存框并把
+  网络线程阻塞在 `replaySignal.Wait()`，导致其后的 `STOC_CHANGE_SIDE` 收不到。控制驱动模式下控制层会
+  自动点"不保存"（日志 `UI auto-confirm kind=replay-save (skip save)`），保证换备包继续处理。
+
 ### 3.6 `GET /act`（底层原始响应）
 
 直接发协议响应，用于排障/特殊场景；正常请用 `/act_id`。
@@ -223,6 +242,8 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act?seq=42&i=-1"
 | `GET|POST /start` | 房主开始对局（`CTOS_HS_START`） | `{"ok":true,"queued":true}`；日志 `start: sending HS_START` |
 | `GET|POST /leave` | 离开房间回主菜单（重连/换房用） | `{"ok":true,"queued":true}` |
 | `GET|POST /surrender` | 投降（`CTOS_SURRENDER`） | `{"ok":true,"queued":true}` |
+| `GET|POST /hostopts?match=1` | LAN Bo3 辅助：把建房 `cbMatchMode` 选到指定模式（0=Single、1=Match、2=Tag） | `{"ok":true,"queued":true,"matchMode":1}`；日志 `hostopts: matchMode=...` |
+| `GET|POST /host?match=1&port=7911` | 同上并**直接建房**（等价 `-c -p`：设 `serverport` + 点 `HOST_CONFIRM`） | `{"ok":true,"queued":true,"matchMode":1,"port":7911}` |
 
 ```bat
 curl.exe -s -X POST "http://127.0.0.1:7788/deck?name=Blackwing"
@@ -314,6 +335,7 @@ curl.exe -s -X POST http://127.0.0.1:7788/net/probe
 | 选素材（`MSG_SELECT_SUM`=23） | `sum` | 字节 `[n, seqNo...]`，按 `opParam` 贪心凑 `sumTarget` |
 | 指示物/排序/宣言 | `counter` / `sort` / `announce` | 安全默认（多为 `[n, seqNo...]` 或 `i=0`） |
 | 先/后攻（`STOC_SELECT_TP`） | `tp` | 仅 `/act_id`：`id=0`→`res=1`（先攻），`id=1`→`res=2`（后攻） |
+| 换备牌（`STOC_CHANGE_SIDE`，Bo3） | `side_ok` | 仅 `/act_id`：`id=0`（保持备牌、继续）；客户端点击真实 `btnSideOK` |
 | 其它未建模 prompt | `auto` | 客户端安全默认（不应依赖它做关键决策） |
 
 > `/actions` 里的 `label` 只是给人/LLM 看的提示（`summon #0 code=…`），**决策请用 `id`**，不要解析 label。
@@ -380,6 +402,9 @@ curl.exe -s -X POST "http://127.0.0.1:7788/start"
 > 排位注意：
 > - 卡组必须符合服务器 lflist（超限会在准备/开始阶段被拒）；用 `/state.deckError` 判断原因。
 > - 只看 `isWin/isLoss/isDraw` 判胜负；`winPlayer` 是 raw 座位号（客机 raw 1 时 raw 0 = 对手赢）。
+> - **Bo3 换备（Game1→Game2）**：Game1 结束后 `/prompt` 会出现 `sidePending:true`，`/actions` 给
+>   `kind:"side_ok"`，`/act_id?id=0` 后继续（保持备牌不变）；随后下一局重新走 `/ready`。
+>   Bo3 是 Match 模式，排位房间由服务器设定；若 LAN 复现可用 `/host?match=1&port=7911` 建房。
 
 ### 5.3 连锁示例
 

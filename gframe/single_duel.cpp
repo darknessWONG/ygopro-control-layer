@@ -513,7 +513,10 @@ void SingleDuel::Process() {
 		DuelEndProc();
 }
 void SingleDuel::DuelEndProc() {
+	Control::Log("DuelEndProc match_mode=%d duel_count=%d stage=%d players=%p,%p", (int)match_mode,
+		duel_count, (int)duel_stage, (void*)players[0], (void*)players[1]);
 	if(!match_mode) {
+		Control::Log("DuelEndProc -> SEND DUEL_END (single)");
 		NetServer::SendPacketToPlayer(players[0], STOC_DUEL_END);
 		NetServer::ReSendToPlayer(players[1]);
 		for(auto oit = observers.begin(); oit != observers.end(); ++oit)
@@ -533,6 +536,7 @@ void SingleDuel::DuelEndProc() {
 				NetServer::ReSendToPlayer(*oit);
 			duel_stage = DUEL_STAGE_END;
 		} else {
+			Control::Log("DuelEndProc -> SEND CHANGE_SIDE (winc=%d/%d/%d)", winc[0], winc[1], winc[2]);
 			if(players[0] != pplayer[0]) {
 				players[0] = pplayer[0];
 				players[1] = pplayer[1];
@@ -555,6 +559,8 @@ void SingleDuel::DuelEndProc() {
 	}
 }
 void SingleDuel::Surrender(DuelPlayer* dp) {
+	Control::Log("SURRENDER dp=%p type=%d match_mode=%d pduel=%p duel_count=%d", (void*)dp,
+		dp ? (int)dp->type : -1, (int)match_mode, (void*)pduel, duel_count);
 	if(dp->type > 1 || !pduel)
 		return;
 	unsigned char wbuf[3];

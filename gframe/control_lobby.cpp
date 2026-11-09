@@ -261,6 +261,38 @@ bool ExecLobbyAction(const Action& a) {
 		}
 		break;
 	}
+	case ActionKind::SideOk: {
+		// task-35: click the real btnSideOK so the client's own BUTTON_SIDE_OK handler runs
+		// (count check -> SendUpdateDeck).  The siding UI was opened by STOC_CHANGE_SIDE.
+		if (!mainGame->btnSideOK) {
+			Control::Log("SIDE ok: btnSideOK not available");
+			break;
+		}
+		Control::Log("SIDE ok clicked (from control) visible=%d",
+			mainGame->btnSideOK->isVisible() ? 1 : 0);
+		ClickGuiButton(mainGame->btnSideOK);
+		break;
+	}
+	case ActionKind::HostOpts: {
+		// task-35: LAN Bo3 helper.  port==0 -> only select the match-mode combo; port>0 -> also
+		// create the room (same handler as the `-c` launch flag: hide main menu + HOST_CONFIRM).
+		if (mainGame->cbMatchMode) {
+			int m = a.i;
+			if (m < 0 || m > 2) m = 1;
+			mainGame->cbMatchMode->setSelected((irr::u32)m);
+			Control::Log("hostopts: matchMode=%d selected (LAN Bo3 helper)", m);
+		} else {
+			Control::Log("hostopts: cbMatchMode not available");
+		}
+		if (a.port > 0) {
+			mainGame->gameConf.serverport = a.port;
+			mainGame->bot_mode = false;
+			mainGame->HideElement(mainGame->wMainMenu);
+			Control::Log("hostopts: creating LAN room port=%d (click HOST_CONFIRM)", a.port);
+			ClickGuiButton(mainGame->btnHostConfirm);
+		}
+		break;
+	}
 	case ActionKind::Tp: {
 		// task-34: send the LLM-chosen first/second result (1=first, 2=second)
 		if (!DuelClient::IsConnected()) {

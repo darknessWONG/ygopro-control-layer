@@ -323,13 +323,17 @@ void NetServer::HandleCTOSPacket(DuelPlayer* dp, unsigned char* data, size_t len
 		break;
 	}
 	case CTOS_CREATE_GAME: {
-		if(dp->game || duel_mode)
+		if(dp->game || duel_mode) {
+			Control::Log("SERVER create ignored (dp->game=%p duel_mode=%p)", (void*)dp->game, (void*)duel_mode);
 			return;
+		}
 		if (len < 1 + sizeof(CTOS_CreateGame))
 			return;
 		CTOS_CreateGame packet;
 		std::memcpy(&packet, pdata, sizeof packet);
 		auto pkt = &packet;
+		Control::Log("SERVER create request mode=%d rule=%d lflist=%u", (int)pkt->info.mode,
+			(int)pkt->info.rule, (unsigned)pkt->info.lflist);
 		if(pkt->info.rule > CURRENT_RULE)
 			pkt->info.rule = CURRENT_RULE;
 		if(pkt->info.mode > MODE_TAG)
