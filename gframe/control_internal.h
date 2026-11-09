@@ -217,6 +217,7 @@ extern std::atomic<bool> g_tpPromptActive; // synthetic tp prompt published and 
 // click btnSideOK automatically but publish a synthetic prompt (kind "side_ok") for the LLM.
 extern std::atomic<bool> g_sidePending;      // STOC_CHANGE_SIDE seen, waiting for /act_id
 extern std::atomic<bool> g_sidePromptActive; // synthetic side prompt published and awaiting
+extern std::atomic<int> g_matchGame;         // STOC_DUEL_START counter (Bo3 game number)
 enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave, Tp, SideOk, HostOpts };
 struct Action {
 	ActionKind kind{ ActionKind::None };

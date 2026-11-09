@@ -492,6 +492,7 @@ std::atomic<bool> g_tpPromptActive{ false };
 // task-35: Bo3 side decking (see control_internal.h)
 std::atomic<bool> g_sidePending{ false };
 std::atomic<bool> g_sidePromptActive{ false };
+std::atomic<int> g_matchGame{ 0 }; // task-35f: count of STOC_DUEL_START (Bo3 games)
 // task-28h: chain-candidate capture (definitions; see control_internal.h)
 std::mutex g_chainAnalyzeMutex;
 int g_chainAnalyzeCount{ -1 };
@@ -1758,6 +1759,22 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 	// stoc hook is off (host runs with YGO_HOOKS=msganalyze).
 	if (pktType == STOC_DUEL_START) {
 		g_applyChainPending.store(true);
+		// task-35f: a new game in a match (Bo3 Game2/3) must not inherit Game1's result/pending
+		// state, otherwise /state.winPlayer stays at the previous winner and policy exits at once.
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			g_winPlayer = -1;
+			g_winPlayerLocal = -1;
+			g_winReason = -1;
+			g_awaiting = false;
+			g_promptSnapValid.store(false);
+		}
+		g_tpPending.store(false);
+		g_tpPromptActive.store(false);
+		g_sidePending.store(false);
+		g_sidePromptActive.store(false);
+		const int game = g_matchGame.fetch_add(1) + 1;
+		Control::Log("DUEL_START reset result state (match game %d) winPlayer=-1 awaiting=0 tp=0 side=0", game);
 		Control::Log("STOC_DUEL_START -> chain mode pending (%s)", ChainModeName(g_chainMode.load()));
 	}
 	if (!(g_hookMask & 4)) return;
