@@ -126,6 +126,21 @@ struct WinSnap {
 	std::string text;
 };
 
+// task-36: Bo3 side-decking view (aggregated deck lists for /state.side)
+struct SideAgg {
+	unsigned code{ 0 };
+	std::string name;
+	int count{ 0 };
+};
+struct SideSnap {
+	bool available{ false };      // deckManager.current_deck was read (we are siding)
+	std::vector<SideAgg> main, extra, side;
+	int mainCount{ 0 }, extraCount{ 0 }, sideCount{ 0 };
+	int preMain{ 0 }, preExtra{ 0 }, preSide{ 0 }; // counts when STOC_CHANGE_SIDE arrived
+	bool preValid{ false };
+	std::string countsError; // "counts must match" while main/extra/side differ from pre_*
+};
+
 struct Snapshot {
 	bool valid{ false };
 	bool inDuel{ false };
@@ -196,6 +211,7 @@ struct Snapshot {
 	size_t lastMsgLen{ 0 };
 	std::string lastMsgHex;
 	std::vector<int> recentMsgs; // last N game-message ids (oldest first)
+	SideSnap side;               // task-36: Bo3 side-decking view
 };
 
 // control_sem.cpp: one semantic action offered to the LLM for the current prompt.
@@ -218,7 +234,20 @@ extern std::atomic<bool> g_tpPromptActive; // synthetic tp prompt published and 
 extern std::atomic<bool> g_sidePending;      // STOC_CHANGE_SIDE seen, waiting for /act_id
 extern std::atomic<bool> g_sidePromptActive; // synthetic side prompt published and awaiting
 extern std::atomic<int> g_matchGame;         // STOC_DUEL_START counter (Bo3 game number)
-enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave, Tp, SideOk, HostOpts };
+extern std::atomic<bool> g_sideWaiting;      // STOC_WAITING_SIDE (opponent still siding)
+extern std::atomic<uint64_t> g_sideWaitSince; // tick when waiting started
+extern std::atomic<bool> g_sideWaitingSeen;   // sticky: we entered waiting this siding window
+extern std::atomic<uint64_t> g_sideLastWaitMs; // sticky: duration of the last waiting period
+// task-36: /side_swap helper (control_lobby.cpp): validate a planned move and return counts
+bool SideSwapPlan(unsigned code, const std::string& from, const std::string& to, int n,
+	std::string& err, int* m, int* e, int* s);
+// task-36: /side_swap action execution on the UI thread
+bool SideDoSwap(unsigned code, const std::string& from, const std::string& to, int n);
+// task-36: mark "we confirmed, now waiting for the opponent" (sticky diagnostics too)
+void SideMarkWaiting();
+// task-36: readable side_ok validation error ("counts must match" or empty)
+std::string SideCountsError();
+enum class ActionKind { None, Int32, Bytes, Ready, Join, Start, NotReady, Surrender, Deck, MsgOk, UiSem, UiPoint, UiMenu, Leave, Tp, SideOk, HostOpts, SideSwap };
 struct Action {
 	ActionKind kind{ ActionKind::None };
 	int32_t i{ 0 };

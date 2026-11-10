@@ -92,6 +92,7 @@ curl.exe -s http://127.0.0.1:7788/health
 | 管线 | `pipeline:{analyzeCount,pumpCount,msgCount,seq,awaiting,lastStoc,lastStocName,sinceLastAnalyzeMs,sinceLastPumpMs,retryCount,lastRetryAfterMsg,lastNonRetryMsg,retryStreak,placeVariant,autoDismiss,dismissCount,recentMsgs}` + 顶层别名 `retryCount` `retryStreak` `placeVariant` `lastMsg:{id,len,hex}` |
 | 提示 | `prompt`（同 `/prompt`） |
 | 网络/重连 | `net`（同 `/net`）、`resume`（journal 恢复信息或 `null`）、`deckError`（见 §3.4） |
+| 换备（Bo3） | `side`：`available/pending/waiting/main/extra/side/counts/pre/limits/error/note`（见 §3.5.1.1） |
 | 其它 | `deckMain` `deckExtra` `errorMsg` `errorCode`（最近一条 `STOC_ERROR_MSG` 的 msg/code） |
 
 ```bat
@@ -210,6 +211,62 @@ Bo3 的 `Game1 → Game2` 之间服务端会发 `STOC_CHANGE_SIDE`（进 siding 
 - **重要**：每局结束服务端会发 `STOC_REPLAY`（回放），若客户端"自动保存回放"未勾选会弹保存框并把
   网络线程阻塞在 `replaySignal.Wait()`，导致其后的 `STOC_CHANGE_SIDE` 收不到。控制驱动模式下控制层会
   自动点"不保存"（日志 `UI auto-confirm kind=replay-save (skip save)`），保证换备包继续处理。
+
+#### 3.5.1.1 `/state.side`（换备信息）
+
+`STOC_CHANGE_SIDE` 期间 `/state.side` 给出当前正在编辑的卡组（数据源 `deckManager.current_deck`）：
+
+```json
+"side": {
+  "available": true,
+  "pending": true,
+  "waiting": false,
+  "waitingSeen": false,
+  "lastWaitMs": 0,
+  "elapsedMs": 0,
+  "main":  [{"code":14558127,"name":"灰流丽","count":2}],
+  "extra": [{"code":52687916,"name":"...","count":1}],
+  "side":  [{"code":23434538,"name":"增殖的G","count":1}],
+  "counts": {"main":40,"extra":15,"side":15},
+  "pre":    {"main":40,"extra":15,"side":15},
+  "limits": {"mainMin":40,"mainMax":60,"extraMax":15,"sideMax":15},
+  "error": null,
+  "note": "swap must keep main/extra/side counts unchanged (client validates on btnSideOK)"
+}
+```
+
+- `main/extra/side` 是**按卡号聚合**的列表（`code`+`name`+`count`），不是逐张顺序；
+- `counts` 是当前各区张数，`pre` 是 `STOC_CHANGE_SIDE` 到达时的张数；两者不一致时 `error` 为
+  `"counts must match"`（此时 `side_ok` 会被拒绝，见下）；
+- `waiting` 是**瞬时值**：自己已确认、还没收到下一局 `DUEL_START` 时为 true；LAN 内置服务端可能只持续
+  十几毫秒（双方都快时），所以**断言优先看 sticky 字段**：
+  `waitingSeen`（本次换备是否进入过等待）、`lastWaitMs`（上次等待时长，下一局开始时写入，
+  保留到下一次 `STOC_CHANGE_SIDE`）、`elapsedMs`（正在等待时的已等待毫秒，`waiting=true` 时递增）；
+- `waiting:true` 期间日志 `SIDE waiting for opponent (elapsed=..ms)` 每 10s 打一次，**不会退出**；
+  对手掉线用 `/net`（`alive`/`state`/`sinceLastStoc`）判断，不要靠换备状态猜。
+
+#### 3.5.1.2 `/side_swap`（换备操作）
+
+`GET|POST /side_swap?code=<card>&from=main|extra|side&to=main|extra|side[&n=1]`
+
+- 把 `code` 的 `n` 张从 `from` 区移到 `to` 区（只改 `deckManager.current_deck`，UI 线程执行并刷新视图）；
+- 校验：`from` 区必须真有这么多张；`from != to`；区名合法；不合法返回
+  `{"ok":false,"error":"..."}`（如 `not enough copies in side (have 1, need 2)`）；
+- 返回当前（预测）张数：`{"ok":true,"queued":true,"main":40,"extra":15,"side":15}`；
+- 日志：`SIDE swap code=.. from=.. to=.. n=.. -> counts m/e/s=..`。
+
+```bat
+curl.exe -s -X POST "http://127.0.0.1:7788/side_swap?code=23434538&from=side&to=main&n=1"
+curl.exe -s -X POST "http://127.0.0.1:7788/side_swap?code=23434538&from=main&to=side&n=1"
+curl.exe -s http://127.0.0.1:7788/state          :: 看 state.side.counts 是否变化
+```
+
+> 换备必须保持 **main/extra/side 张数不变**（main 40 张、extra 15、side 15 起步；只允许在区之间交换）。
+> 若张数变了，`/actions.sideError` / `/state.side.error` 会显示 `"counts must match"`，`/act_id?id=0`
+> 返回 `{"ok":false,"error":"counts must match",...}` 并记 `SIDE ok rejected reason=counts must match`。
+> 点击 `btnSideOK` 之前客户端会在 UI 线程**再校验一次**（exec-time），不一致则不点击并记
+> `SIDE ok rejected reason=counts must match (exec-time)`；刚调用 `/side_swap` 还没执行完时
+> `side_ok` 会先返回 `{"ok":false,"error":"side swap pending, retry"}`，稍后重试即可。
 
 ### 3.6 `GET /act`（底层原始响应）
 

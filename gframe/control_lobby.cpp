@@ -119,6 +119,81 @@ static bool LoadDeckBySections(const std::string& name) {
 
 
 // ---------------------------------------------------------------------------
+// task-36: Bo3 side decking helpers (main/extra/side live in deckManager.current_deck).
+// ---------------------------------------------------------------------------
+static std::vector<const CardDataC*>* SideBucket(const std::string& name) {
+	if (!mainGame) return nullptr;
+	if (name == "main") return &deckManager.current_deck.main;
+	if (name == "extra") return &deckManager.current_deck.extra;
+	if (name == "side") return &deckManager.current_deck.side;
+	return nullptr;
+}
+
+std::string SideCountsError() {
+	if (!mainGame || !mainGame->is_siding) return "";
+	auto& db = mainGame->deckBuilder;
+	const auto& d = deckManager.current_deck;
+	if (d.main.size() != db.pre_mainc || d.extra.size() != db.pre_extrac || d.side.size() != db.pre_sidec)
+		return "counts must match";
+	return "";
+}
+
+bool SideSwapPlan(unsigned code, const std::string& from, const std::string& to, int n,
+	std::string& err, int* m, int* e, int* s) {
+	if (!mainGame) { err = "client not ready"; return false; }
+	auto* fb = SideBucket(from);
+	auto* tb = SideBucket(to);
+	if (!fb || !tb) { err = "from/to must be main|extra|side"; return false; }
+	if (from == to) { err = "from and to are the same"; return false; }
+	if (n <= 0) { err = "n must be >= 1"; return false; }
+	int have = 0;
+	for (auto* c : *fb) if (c && c->code == code) ++have;
+	if (have < n) {
+		err = "not enough copies in " + from + " (have " + std::to_string(have) + ", need " +
+			std::to_string(n) + ")";
+		return false;
+	}
+	*m = (int)deckManager.current_deck.main.size();
+	*e = (int)deckManager.current_deck.extra.size();
+	*s = (int)deckManager.current_deck.side.size();
+	if (from == "main") *m -= n; else if (from == "extra") *e -= n; else *s -= n;
+	if (to == "main") *m += n; else if (to == "extra") *e += n; else *s += n;
+	return true;
+}
+
+bool SideDoSwap(unsigned code, const std::string& from, const std::string& to, int n) {
+	auto* fb = SideBucket(from);
+	auto* tb = SideBucket(to);
+	if (!fb || !tb || from == to || n <= 0) return false;
+	DeckBuilder& db = mainGame->deckBuilder;
+	for (int k = 0; k < n; ++k) {
+		int idx = -1;
+		const CardDataC* ptr = nullptr;
+		for (size_t i = 0; i < fb->size(); ++i) {
+			if ((*fb)[i] && (*fb)[i]->code == code) { idx = (int)i; ptr = (*fb)[i]; break; }
+		}
+		if (idx < 0 || !ptr) return false;
+		// pop_* / push_* keep is_modified and the hover display in sync with current_deck
+		if (from == "main") db.pop_main(idx);
+		else if (from == "extra") db.pop_extra(idx);
+		else db.pop_side(idx);
+		const bool ok = (to == "main") ? db.push_main(ptr)
+			: (to == "extra") ? db.push_extra(ptr) : db.push_side(ptr);
+		if (!ok) {
+			if (from == "main") db.push_main(ptr);
+			else if (from == "extra") db.push_extra(ptr);
+			else db.push_side(ptr);
+			return false;
+		}
+	}
+	g_snapshotWanted.store(true);
+	Control::Log("SIDE swap code=%u from=%s to=%s n=%d -> counts m/e/s=%d/%d/%d", code,
+		from.c_str(), to.c_str(), n, (int)deckManager.current_deck.main.size(),
+		(int)deckManager.current_deck.extra.size(), (int)deckManager.current_deck.side.size());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // task-29a: deck combo helpers. The normal prepare flow is "pick the deck in cbDeckSelect,
 // then press ready"; the ready handler loads that deck and sends UpdateDeck + HS_READY.
 // LoadDeckBySections() alone does NOT change the combo selection, so the ranked server could
@@ -261,6 +336,20 @@ bool ExecLobbyAction(const Action& a) {
 		}
 		break;
 	}
+	case ActionKind::SideSwap: {
+		// task-36: apply one queued side-deck move (main/extra/side)
+		const size_t sep = a.deckName.find('>');
+		if (sep == std::string::npos) {
+			Control::Log("SIDE swap: bad from>to spec");
+			break;
+		}
+		const std::string from = a.deckName.substr(0, sep);
+		const std::string to = a.deckName.substr(sep + 1);
+		if (!SideDoSwap((unsigned)a.i, from, to, a.port))
+			Control::Log("SIDE swap failed code=%u from=%s to=%s n=%d", (unsigned)a.i,
+				from.c_str(), to.c_str(), a.port);
+		break;
+	}
 	case ActionKind::SideOk: {
 		// task-35: click the real btnSideOK so the client's own BUTTON_SIDE_OK handler runs
 		// (count check -> SendUpdateDeck).  The siding UI was opened by STOC_CHANGE_SIDE.
@@ -268,9 +357,19 @@ bool ExecLobbyAction(const Action& a) {
 			Control::Log("SIDE ok: btnSideOK not available");
 			break;
 		}
+		// task-36: reject before clicking when the swap changed the original counts (the native
+		// handler would popup 1410 and silently keep us in siding).
+		const std::string countsErr = SideCountsError();
+		if (!countsErr.empty()) {
+			Control::Log("SIDE ok rejected reason=%s (exec-time)", countsErr.c_str());
+			break;
+		}
 		Control::Log("SIDE ok clicked (from control) visible=%d",
 			mainGame->btnSideOK->isVisible() ? 1 : 0);
 		ClickGuiButton(mainGame->btnSideOK);
+		// task-36: after confirming we wait for the opponent; keep /state.side.waiting=true until the
+		// next game starts (the server does not send us STOC_WAITING_SIDE after we confirm).
+		SideMarkWaiting();
 		break;
 	}
 	case ActionKind::HostOpts: {

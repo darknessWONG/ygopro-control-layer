@@ -231,10 +231,15 @@ std::string PromptJson(const Snapshot& s) {
 	if (g_tpPromptActive.load()) {
 		os << ",\"tpPending\":true,\"tpOptions\":[1,2],\"tpChooseBy\":\"act_id kind=tp index=1|2\"";
 	}
-	// task-35: Bo3 side decking prompt
-	if (g_sidePromptActive.load()) {
-		os << ",\"sidePending\":true,\"sideChooseBy\":\"act_id kind=side_ok id=0\"";
+	// task-35/36: Bo3 side decking prompt (lists/counts come from the frozen snapshot)
+	if (g_sidePromptActive.load() || g_sidePending.load()) {
+		os << ",\"sidePending\":true,\"sideChooseBy\":\"act_id kind=side_ok id=0\""
+		   << ",\"sideSummary\":{\"main\":" << s.side.mainCount << ",\"extra\":"
+		   << s.side.extraCount << ",\"side\":" << s.side.sideCount << '}'
+		   << ",\"sideError\":"
+		   << (s.side.countsError.empty() ? "null" : ("\"" + JsonEscape(s.side.countsError) + "\""));
 	}
+	if (g_sideWaiting.load()) os << ",\"sideWaiting\":true";
 	os << ",\"summonable\":" << s.summonable
 	   << ",\"spsummonable\":" << s.spsummonable
 	   << ",\"msetable\":" << s.msetable
@@ -347,6 +352,46 @@ std::string UiJson(const Snapshot& s) {
 	os << '}';
 	return os.str();
 }
+
+// task-36: /state.side (Bo3 side-decking view)
+static std::string SideJson(const Snapshot& s) {
+	std::ostringstream os;
+	const bool pending = g_sidePending.load() || g_sidePromptActive.load();
+	const uint64_t waitSince = g_sideWaitSince.load();
+	const long long waitElapsed = (g_sideWaiting.load() && waitSince)
+		? (long long)(GetTickCount64() - waitSince) : 0;
+	os << "{\"available\":" << (s.side.available ? "true" : "false")
+	   << ",\"pending\":" << (pending ? "true" : "false")
+	   << ",\"waiting\":" << (g_sideWaiting.load() ? "true" : "false")
+	   << ",\"waitingSeen\":" << (g_sideWaitingSeen.load() ? "true" : "false")
+	   << ",\"lastWaitMs\":" << (unsigned long long)g_sideLastWaitMs.load()
+	   << ",\"elapsedMs\":" << waitElapsed;
+	auto arr = [&os](const char* key, const std::vector<SideAgg>& v) {
+		os << ",\"" << key << "\":[";
+		for (size_t i = 0; i < v.size(); ++i) {
+			if (i) os << ',';
+			os << "{\"code\":" << v[i].code << ",\"name\":\"" << JsonEscape(v[i].name)
+			   << "\",\"count\":" << v[i].count << '}';
+		}
+		os << ']';
+	};
+	arr("main", s.side.main);
+	arr("extra", s.side.extra);
+	arr("side", s.side.side);
+	os << ",\"counts\":{\"main\":" << s.side.mainCount << ",\"extra\":" << s.side.extraCount
+	   << ",\"side\":" << s.side.sideCount << '}'
+	   << ",\"pre\":{\"main\":" << s.side.preMain << ",\"extra\":" << s.side.preExtra
+	   << ",\"side\":" << s.side.preSide << '}'
+	   << ",\"limits\":{\"mainMin\":" << DECK_MIN_SIZE << ",\"mainMax\":" << DECK_MAX_SIZE
+	   << ",\"extraMax\":" << EXTRA_MAX_SIZE << ",\"sideMax\":" << SIDE_MAX_SIZE << '}'
+	   << ",\"error\":"
+	   << (s.side.countsError.empty() ? "null" : ("\"" + JsonEscape(s.side.countsError) + "\""))
+	   << ",\"note\":\"swap must keep main/extra/side counts unchanged (client validates on btnSideOK)\"}";
+	return os.str();
+}
+
+// task-36: /state.side (Bo3 side-decking view)
+static std::string SideJson(const Snapshot& s);
 
 std::string SnapshotJson(const Snapshot& s) {
 	std::ostringstream os;
@@ -465,6 +510,7 @@ std::string SnapshotJson(const Snapshot& s) {
 	os << ",\"net\":" << NetJson();
 	os << ",\"resume\":" << ResumeJson();
 	os << ",\"deckError\":" << DeckErrorJson();
+	os << ",\"side\":" << SideJson(s);
 	os << '}';
 	return os.str();
 }
@@ -799,6 +845,39 @@ void SnapshotFromClient(Snapshot& s) {
 			Snapshot::PlaceSnap ps; ps.ctrl = ctrl; ps.loc = loc; ps.seq = seq; ps.bit = bit;
 			s.places.push_back(ps);
 		}
+	}
+	// task-36: Bo3 side-decking view (deckManager.current_deck is UI-thread state)
+	if (mainGame->is_siding) {
+		s.side.available = true;
+		auto fill = [](std::vector<SideAgg>& out, const std::vector<const CardDataC*>& src) {
+			for (auto* c : src) {
+				if (!c) continue;
+				bool merged = false;
+				for (auto& a : out) {
+					if (a.code == c->code) { ++a.count; merged = true; break; }
+				}
+				if (!merged) {
+					SideAgg a;
+					a.code = c->code;
+					a.name = CardNameOf(c->code);
+					a.count = 1;
+					out.push_back(std::move(a));
+				}
+			}
+		};
+		fill(s.side.main, deckManager.current_deck.main);
+		fill(s.side.extra, deckManager.current_deck.extra);
+		fill(s.side.side, deckManager.current_deck.side);
+		s.side.mainCount = (int)deckManager.current_deck.main.size();
+		s.side.extraCount = (int)deckManager.current_deck.extra.size();
+		s.side.sideCount = (int)deckManager.current_deck.side.size();
+		s.side.preMain = (int)mainGame->deckBuilder.pre_mainc;
+		s.side.preExtra = (int)mainGame->deckBuilder.pre_extrac;
+		s.side.preSide = (int)mainGame->deckBuilder.pre_sidec;
+		s.side.preValid = true;
+		if (s.side.mainCount != s.side.preMain || s.side.extraCount != s.side.preExtra ||
+			s.side.sideCount != s.side.preSide)
+			s.side.countsError = "counts must match";
 	}
 	s.valid = true;
 }

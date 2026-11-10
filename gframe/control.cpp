@@ -493,6 +493,11 @@ std::atomic<bool> g_tpPromptActive{ false };
 std::atomic<bool> g_sidePending{ false };
 std::atomic<bool> g_sidePromptActive{ false };
 std::atomic<int> g_matchGame{ 0 }; // task-35f: count of STOC_DUEL_START (Bo3 games)
+// task-36: side-decking waiting state
+std::atomic<bool> g_sideWaiting{ false };
+std::atomic<uint64_t> g_sideWaitSince{ 0 };
+std::atomic<bool> g_sideWaitingSeen{ false };
+std::atomic<uint64_t> g_sideLastWaitMs{ 0 };
 // task-28h: chain-candidate capture (definitions; see control_internal.h)
 std::mutex g_chainAnalyzeMutex;
 int g_chainAnalyzeCount{ -1 };
@@ -1104,11 +1109,31 @@ void NotifyUserImpl(int msgId, const char* tag) {
 }
 
 // task-35: Bo3 side decking hooks (called from DuelClient STOC handlers)
+void SideMarkWaiting() {
+	g_sideWaiting.store(true);
+	g_sideWaitSince.store(GetTickCount64());
+	g_sideWaitingSeen.store(true);
+	g_snapshotWanted.store(true);
+}
+
 void OnChangeSideImpl() {
 	// task-35d: always log arrival (manual or driven) so LAN/ranked Bo3 can be diagnosed
 	Control::Log("STOC_CHANGE_SIDE received (controlDriven=%d)", g_controlDriven.load() ? 1 : 0);
+	g_snapshotWanted.store(true); // task-36: build the side lists for /state.side
+	// task-36: a new siding window resets the sticky waiting diagnostics
+	g_sideWaitingSeen.store(false);
+	g_sideLastWaitMs.store(0);
 	if (!g_controlDriven.load()) return; // manual play keeps the original siding UI
 	g_sidePending.store(true);
+	g_sideWaiting.store(false);
+	// task-36c: the siding window supersedes any older prompt/awaiting state; otherwise the
+	// synthetic side prompt would never publish (Pump requires awaiting==false).
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		g_awaiting = false;
+		g_promptSnapValid.store(false);
+	}
+	g_cv.notify_all();
 	Control::Log("SIDE pending: waiting for LLM side_ok (control-driven, no auto-click)");
 }
 
@@ -1119,6 +1144,7 @@ void OnWaitingSideImpl() {
 	const bool hadPrompt = g_sidePromptActive.load();
 	g_sidePending.store(false);
 	g_sidePromptActive.store(false);
+	SideMarkWaiting();
 	{
 		std::lock_guard<std::mutex> lk(g_mutex);
 		if (hadPrompt && g_awaiting) {
@@ -1127,7 +1153,7 @@ void OnWaitingSideImpl() {
 		}
 	}
 	g_cv.notify_all();
-	Control::Log("SIDE waiting for opponent%s", hadPrompt ? " (side prompt released)" : "");
+	Control::Log("SIDE waiting for opponent (elapsed=0ms)%s", hadPrompt ? " (side prompt released)" : "");
 }
 
 
@@ -1260,12 +1286,21 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 		} else if (path == "/actions") {
 			std::lock_guard<std::mutex> lk(g_mutex);
 			if (g_sidePromptActive.load()) {
-				// task-35: Bo3 side decking — keep the side deck unchanged and continue
+				// task-36: side decking offers side_ok; expose the current counts + any mismatch
+				// (counts must equal the values captured when STOC_CHANGE_SIDE arrived).
+				const bool preOk = g_shared.side.preValid;
+				const bool mismatch = preOk && (g_shared.side.mainCount != g_shared.side.preMain ||
+					g_shared.side.extraCount != g_shared.side.preExtra ||
+					g_shared.side.sideCount != g_shared.side.preSide);
 				std::ostringstream oss;
 				oss << "{\"actions\":[{\"id\":0,\"kind\":\"side_ok\","
 				    << "\"label\":\"keep side deck (no changes) and continue\"}],"
 				    << "\"awaiting\":true,\"sidePending\":true,\"curMsg\":" << g_promptSnap.curMsg
-				    << ",\"seq\":" << (unsigned long long)g_seq << '}';
+				    << ",\"seq\":" << (unsigned long long)g_seq
+				    << ",\"counts\":{\"main\":" << g_shared.side.mainCount
+				    << ",\"extra\":" << g_shared.side.extraCount
+				    << ",\"side\":" << g_shared.side.sideCount << '}'
+				    << ",\"sideError\":" << (mismatch ? "\"counts must match\"" : "null") << '}';
 				body = oss.str();
 			} else if (g_tpPromptActive.load()) {
 				// task-34: first/second choice; index 1 = first (res=1), index 2 = second (res=2)
@@ -1287,12 +1322,34 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 				body = SemActionsJson(g_promptSnapValid.load() ? g_promptSnap : g_shared);
 			}
 		} else if (path == "/act_id") {
-			if (g_sidePromptActive.load()) {
+			if (g_sidePromptActive.load() || g_sidePending.load()) {
 				// task-35: only one side action (id 0 = keep side deck + continue)
 				const int id = atoi(QueryParam(query, "id").c_str());
 				if (id != 0) {
 					body = "{\"ok\":false,\"error\":\"bad side id (only 0=side_ok)\"}";
 					return body;
+				}
+				// task-36: btnSideOK would popup 1410 if counts changed; reject with a readable
+				// error instead of clicking (side_swap must keep main/extra/side counts stable).
+				const std::string countsErr = SideCountsError();
+				if (!countsErr.empty()) {
+					Control::Log("SIDE ok rejected reason=%s", countsErr.c_str());
+					body = "{\"ok\":false,\"error\":\"" + countsErr + "\",\"sideError\":\"" +
+						countsErr + "\"}";
+					return body;
+				}
+				// task-36b: a queued (not yet executed) side_swap would make the counts check stale;
+				// make the caller retry after the move lands instead of accepting a doomed side_ok.
+				{
+					std::lock_guard<std::mutex> lk(g_mutex);
+					for (const auto& qa : g_actions) {
+						if (qa.kind == ActionKind::SideSwap) {
+							Control::Log("SIDE ok deferred: side_swap still queued");
+							body = "{\"ok\":false,\"error\":\"side swap pending, retry\","
+								"\"sideError\":\"side swap pending, retry\"}";
+							return body;
+						}
+					}
 				}
 				{
 					std::lock_guard<std::mutex> lk(g_mutex);
@@ -1301,9 +1358,15 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 					g_actions.push_back(std::move(a));
 					g_sidePromptActive.store(false);
 					g_sidePending.store(false);
+					// task-36: from this moment we are waiting for the opponent's confirmation
+					SideMarkWaiting();
 					g_awaiting = false;
 				}
 				body = "{\"ok\":true,\"queued\":true,\"kind\":\"side_ok\"}";
+			} else if (g_sidePending.load()) {
+				// task-36b: CHANGE_SIDE seen but the synthetic prompt is not published yet
+				body = "{\"ok\":false,\"error\":\"side prompt not published yet, retry\"}";
+				return body;
 			} else if (g_tpPromptActive.load()) {
 				// task-34: the pending "tp" choice; id 0 = first (res=1), id 1 = second (res=2)
 				const int id = atoi(QueryParam(query, "id").c_str());
@@ -1545,6 +1608,32 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			   << ",\"fails\":" << g_netProbeFails.load()
 			   << ",\"lastReplyPlayerType\":" << g_netProbeReplyType.load() << '}';
 			body = os.str();
+		} else if (path == "/side_swap") {
+			// task-36: move n copies of <code> between main/extra/side (Bo3 side decking)
+			const std::string codeStr = QueryParam(query, "code");
+			const unsigned code = (unsigned)std::strtoul(codeStr.c_str(), nullptr, 10);
+			const std::string from = QueryParam(query, "from");
+			const std::string to = QueryParam(query, "to");
+			int n = atoi(QueryParam(query, "n").c_str());
+			if (n <= 0) n = 1;
+			std::string err;
+			int m = 0, e = 0, s = 0;
+			if (!codeStr.empty() && code == 0) err = "bad code";
+			if (err.empty() && !SideSwapPlan(code, from, to, n, err, &m, &e, &s)) {
+				body = "{\"ok\":false,\"error\":\"" + err + "\"}";
+				return body;
+			}
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				Action a;
+				a.kind = ActionKind::SideSwap;
+				a.i = (int32_t)code;
+				a.port = n;
+				a.deckName = from + ">" + to;
+				g_actions.push_back(std::move(a));
+			}
+			body = "{\"ok\":true,\"queued\":true,\"main\":" + std::to_string(m) +
+				",\"extra\":" + std::to_string(e) + ",\"side\":" + std::to_string(s) + "}";
 		} else if (path == "/hostopts") {
 			// task-35: LAN Bo3 testing helper. match=<0|1|2> selects cbMatchMode
 			// (0=Single, 1=Match, 2=Tag per the client combo); applied on the Pump UI thread.
@@ -1773,6 +1862,15 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 		g_tpPromptActive.store(false);
 		g_sidePending.store(false);
 		g_sidePromptActive.store(false);
+		// task-36: record how long we waited for the opponent before this game started
+		if (g_sideWaiting.load() && g_sideWaitSince.load()) {
+			const uint64_t waited = GetTickCount64() - g_sideWaitSince.load();
+			g_sideLastWaitMs.store(waited);
+			Control::Log("SIDE waiting ended after %llums (next game started)",
+				(unsigned long long)waited);
+		}
+		g_sideWaiting.store(false);
+		g_sideWaitSince.store(0);
 		const int game = g_matchGame.fetch_add(1) + 1;
 		Control::Log("DUEL_START reset result state (match game %d) winPlayer=-1 awaiting=0 tp=0 side=0", game);
 		Control::Log("STOC_DUEL_START -> chain mode pending (%s)", ChainModeName(g_chainMode.load()));
@@ -2222,16 +2320,33 @@ void Control::Pump() {
 	// task-35: Bo3 side decking — STOC_CHANGE_SIDE arrived while control-driven -> publish a
 	// synthetic "side" prompt (same frozen-snapshot mechanism as tp).
 	if (g_sidePending.load() && !g_sidePromptActive.load()) {
+		// build a fresh snapshot on the UI thread so the side lists/counts are present in the
+		// frozen prompt (STOC_CHANGE_SIDE itself does not go through OnAnalyzeEnd)
+		Snapshot fresh;
+		SnapshotFromClient(fresh);
 		std::lock_guard<std::mutex> lk(g_mutex);
 		if (!g_awaiting) {
+			g_shared = fresh;
 			g_sidePromptActive.store(true);
 			++g_seq;
 			g_awaiting = true;
-			g_promptSnap = g_shared;
+			g_promptSnap = fresh;
 			g_promptSnapValid.store(true);
-			Control::Log("PROMPT publish seq=%llu msg=SIDE sidePending=1",
-				(unsigned long long)g_seq);
+			Control::Log("PROMPT publish seq=%llu msg=SIDE sidePending=1 counts m/e/s=%d/%d/%d",
+				(unsigned long long)g_seq, fresh.side.mainCount, fresh.side.extraCount,
+				fresh.side.sideCount);
 			g_cv.notify_all();
+		}
+	}
+	// task-36: while the opponent is still siding, log elapsed time periodically (do not exit)
+	if (g_sideWaiting.load()) {
+		static uint64_t lastSideWaitLog = 0;
+		const uint64_t waitNow = GetTickCount64();
+		if (waitNow - lastSideWaitLog >= 10000) {
+			lastSideWaitLog = waitNow;
+			const uint64_t since = g_sideWaitSince.load();
+			Control::Log("SIDE waiting for opponent (elapsed=%llums)",
+				(unsigned long long)(since ? (waitNow - since) : 0));
 		}
 	}
 	// task-28: liveness prober (/tip) + resume-context journal (both UI-thread only)
