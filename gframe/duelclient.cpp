@@ -65,11 +65,14 @@ bufferevent* DuelClient::client_bev = 0;
 unsigned char DuelClient::duel_client_write[SIZE_NETWORK_BUFFER]{};
 unsigned char DuelClient::selftype = 0;
 std::mutex g_netWriteMutex;
+std::recursive_mutex g_netSendMutex; // task-39: serialises buffer fill + write (network vs UI thread)
 std::vector<HostPacket> DuelClient::hosts;
 
 int DuelClient::WriteBufferEvent(bufferevent* bufev, const void* data, size_t size) {
 	std::lock_guard<std::mutex> lk(g_netWriteMutex);
-	return bufferevent_write(bufev, data, size);
+	const int r = bufferevent_write(bufev, data, size);
+	if (r != 0) Control::Log("NET write failed size=%zu ret=%d bev=%p", size, r, (void*)bufev);
+	return r;
 }
 
 bool DuelClient::StartClient(unsigned int ip, unsigned short port, bool create_game) {
@@ -300,6 +303,9 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 	case STOC_GAME_MSG: {
 		if (len < 1 + sizeof(unsigned char))
 			return;
+		// task-39: packet-level trace (first engine message id) for chain-loop diagnosis
+		Control::Log("STOC_GAME_MSG len=%zu firstid=%d", len > 1 ? len - 1 : 0,
+			len > 1 ? (int)pdata[0] : -1);
 		Control::EnsureStarted();
 		Control::OnMessageBegin(pdata, len - 1);
 		ClientAnalyze(pdata, len - 1);
@@ -1869,6 +1875,15 @@ bool DuelClient::ClientAnalyze(unsigned char* msg, size_t len) {
 			}
 		}
 		if(!select_trigger && !mainGame->dField.chain_forced && (mainGame->ignore_chain || ((count == 0 || specount == 0) && !mainGame->always_chain)) && (count == 0 || !mainGame->chain_when_avail)) {
+			static uint64_t lastAutoDeclineTick = 0;
+			static int autoDeclineBurst = 0;
+			const uint64_t nowTick = GetTickCount64();
+			const uint64_t gap = lastAutoDeclineTick ? (nowTick - lastAutoDeclineTick) : 0;
+			autoDeclineBurst = (gap && gap < 1000) ? (autoDeclineBurst + 1) : 1;
+			lastAutoDeclineTick = nowTick;
+			Control::Log("CHAIN client auto-decline count=%d specount=%d always=%d ignore=%d avail=%d gapMs=%llu burst=%d",
+				count, specount, (int)mainGame->always_chain, (int)mainGame->ignore_chain,
+				(int)mainGame->chain_when_avail, (unsigned long long)gap, autoDeclineBurst);
 			SetResponseI(-1);
 			mainGame->dField.ClearChainSelect();
 			if(mainGame->chkWaitChain->isChecked() && !mainGame->ignore_chain) {
@@ -4108,6 +4123,13 @@ void DuelClient::SetResponseB(void* respB, size_t len) {
 	response_len = len;
 }
 void DuelClient::SendResponse() {
+	std::lock_guard<std::recursive_mutex> slk(g_netSendMutex); // task-39: one response at a time
+	{
+		int32_t rv = -1;
+		if (response_len >= 4) std::memcpy(&rv, response_buf, sizeof rv);
+		Control::Log("SEND RESPONSE curMsg=%d len=%d i=%d", (int)mainGame->dInfo.curMsg,
+			(int)response_len, rv);
+	}
 	switch(mainGame->dInfo.curMsg) {
 	case MSG_SELECT_BATTLECMD: {
 		mainGame->dField.ClearCommandFlag();

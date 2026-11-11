@@ -385,6 +385,10 @@ void CaptureChainAnalyze();
 // with count==0 auto-sends -1). Publishing those as prompts made policy send duplicate responses,
 // which cascaded into endless empty chain prompts in ranked.
 extern std::atomic<uint64_t> g_ctosAtMsgBegin;
+// task-38: only CTOS_RESPONSE counts as "the client answered"; other CTOS (TIME_CONFIRM, ...) must
+// not mask a real prompt (that caused MSG_SELECT_CHAIN prompts to be skipped forever).
+extern std::atomic<uint64_t> g_ctosResponseCount;
+extern std::atomic<uint64_t> g_ctosRespAtMsgBegin;
 // task-28k: raw SELECT_CHAIN header (server's own count/specount), used to recognise prompts the
 // client auto-declines (count==0 && specount!=0x7f) even when the CTOS hook misses the response.
 extern std::atomic<int> g_lastChainRawCount;

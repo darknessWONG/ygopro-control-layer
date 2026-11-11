@@ -295,8 +295,8 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act?seq=42&i=-1"
 |---|---|---|
 | `GET|POST /join?ip=&port=&pass=` | 连接服务器；缺省 `ip=127.0.0.1`、`port=7911` | `{"ok":true,"queued":true}`；成功后 `/lobby`、`/net.joined` 变化 |
 | `GET|POST /deck?name=<deck>` | 加载 `<游戏目录>/deck/<name>.ydk` 并**在准备界面 `cbDeckSelect` 选中该卡组**（缺省 `Blackwing`） | `{"ok":true,"queued":true}`；日志 `deck: select combo name=... -> confirmed` |
-| `GET|POST /ready` | 准备：准备窗口存在时先同步卡组下拉框，再点真实 `btnHostPrepReady`（=真人流程 `LoadCurrentDeck`+`UpdateDeck`+`CTOS_HS_READY`） | `{"ok":true,"queued":true}` |
-| `GET|POST /start` | 房主开始对局（`CTOS_HS_START`） | `{"ok":true,"queued":true}`；日志 `start: sending HS_START` |
+| `GET|POST /ready` | 准备：准备窗口存在时先同步卡组下拉框，再点真实 `btnHostPrepReady`（=真人流程 `LoadCurrentDeck`+`UpdateDeck`+`CTOS_HS_READY`）；**可安全重试**（每次请求都会重新尝试，点击或直发），日志 `ready: attempt #N (clicked|sent direct)` | `{"ok":true,"queued":true}` |
+| `GET|POST /start` | 房主开始对局（`CTOS_HS_START`）；**可安全重试**（每次请求都会重发，已 started 时跳过），日志 `start: sent HS_START #N` | `{"ok":true,"queued":true}` |
 | `GET|POST /leave` | 离开房间回主菜单（重连/换房用） | `{"ok":true,"queued":true}` |
 | `GET|POST /surrender` | 投降（`CTOS_SURRENDER`） | `{"ok":true,"queued":true}` |
 | `GET|POST /hostopts?match=1` | LAN Bo3 辅助：把建房 `cbMatchMode` 选到指定模式（0=Single、1=Match、2=Tag） | `{"ok":true,"queued":true,"matchMode":1}`；日志 `hostopts: matchMode=...` |
@@ -322,6 +322,13 @@ curl.exe -s -X POST "http://127.0.0.1:7788/start"
 | `lastNetMsg:{id,text,ageMs}` | 最近一条服务器消息 |
 
 `/net/probe` 主动探一次（默认自动探活已开启）：`{"ok":<有回包>,"sent":..,"rttMs":..,"alive":..,"fails":..,"lastReplyPlayerType":..}`。
+
+> **被动判死与"对手长考"**：`probe.enabled=false`（例如排位里关掉主动 `/tip`）时，客户端靠
+> `sinceLastStoc` 判死。默认阈值 `YGO_NET_DEAD_SILENCE_MS=10000`，但**当不是我的回合且没有
+> awaiting/queued action 时**有效阈值自动放宽到 **60s**（对手长考/AFK 不再 10s 误报）；静默 >30s 时
+> 每 15s 打日志 `NET silence diag since=.. oppTurn=.. awaiting=.. lastStoc=.. timeLeft=.. effSilence=..`，
+> 判死日志 `NET DEAD reason=stoc-timeout since=.. eff=.. oppTurn=..`。真断线（我方回合或 >60s）仍会判
+> `confirmed_dead`，供 supervisor 重启/重进。
 
 ```bat
 curl.exe -s http://127.0.0.1:7788/net

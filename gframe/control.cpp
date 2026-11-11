@@ -505,6 +505,8 @@ int g_chainAnalyzeMsg{ 0 };
 int g_chainAnalyzeDepth{ 0 };
 std::atomic<bool> g_chainCaptureWanted{ false };
 std::atomic<uint64_t> g_ctosAtMsgBegin{ 0 };
+std::atomic<uint64_t> g_ctosResponseCount{ 0 };
+std::atomic<uint64_t> g_ctosRespAtMsgBegin{ 0 };
 std::atomic<int> g_lastChainRawCount{ 0 };
 std::atomic<int> g_lastChainRawSpecount{ 0 };
 ChainCandRaw g_chainAnalyzeCands[64];
@@ -1016,16 +1018,36 @@ static void NetPumpProber(uint64_t now) {
 	}
 	if (!dueling) return;
 	// ---- passive death check (also the LAN / no-/tip path) --------------
+	// task-40: opponent turns can be silent for a long time (thinking/AFK). With the active prober
+	// disabled a 10s silence must NOT mean "dead": use a much larger threshold when it is the
+	// opponent's turn and we are not awaiting anything.
 	const long long silenceMs = (long long)g_netProbeSilenceMs.load();
-	if (since > silenceMs && now - g_netAliveSince.load() > 2500) {
-		bool busy = false;
-		{
-			std::lock_guard<std::mutex> lk(g_mutex);
-			busy = g_awaiting || !g_actions.empty();
+	bool awaitingNow = false;
+	bool actionsPending = false;
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		awaitingNow = g_awaiting;
+		actionsPending = !g_actions.empty();
+	}
+	const bool oppTurn = (g_turnPlayerLocal >= 0 && g_turnPlayerLocal != 0);
+	const bool quiet = !awaitingNow && !actionsPending && !g_uiPending.active;
+	long long effSilence = silenceMs;
+	if (oppTurn && quiet && effSilence < 60000) effSilence = 60000;
+	// periodic diagnostic when the server stays silent (helps distinguish server bug vs AFK)
+	if (since > 30000) {
+		static uint64_t lastSilenceDiag = 0;
+		if (now - lastSilenceDiag >= 15000) {
+			lastSilenceDiag = now;
+			Control::Log("NET silence diag since=%lldms oppTurn=%d awaiting=%d lastStoc=%s timeLeft=%d effSilence=%lldms",
+				since, oppTurn ? 1 : 0, awaitingNow ? 1 : 0, StocName(g_lastStocId.load()),
+				g_timeLeft, effSilence);
 		}
-		if (!busy && !g_uiPending.active && g_netAlive.exchange(false)) {
+	}
+	if (since > effSilence && now - g_netAliveSince.load() > 2500) {
+		if (quiet && g_netAlive.exchange(false)) {
 			g_netState.store(NET_STATE_CONFIRMED_DEAD);
-			Control::Log("NET DEAD reason=stoc-timeout since=%lldms", since);
+			Control::Log("NET DEAD reason=stoc-timeout since=%lldms eff=%lldms oppTurn=%d",
+				since, effSilence, oppTurn ? 1 : 0);
 		}
 	}
 	// ---- healthy/idle bookkeeping (single source of truth) --------------
@@ -1440,19 +1462,35 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 		} else if (path == "/lobby") {
 			std::lock_guard<std::mutex> lk(g_mutex);
 			int ready0 = 0, ready1 = 0;
+			int state0 = -1, state1 = -1; // last state for each seat (9=ready, 10=not ready)
 			for (int st : g_hsStatuses) {
 				int pos = (st >> 4) & 0xf;
 				int state = st & 0xf;
-				if (pos == 0) ready0 = (state == 9) ? 1 : 0;
-				if (pos == 1) ready1 = (state == 9) ? 1 : 0;
+				if (pos == 0) { ready0 = (state == 9) ? 1 : 0; state0 = state; }
+				if (pos == 1) { ready1 = (state == 9) ? 1 : 0; state1 = state; }
 			}
+			int playerCount = (state0 >= 0 ? 1 : 0) + (state1 >= 0 ? 1 : 0);
 			std::ostringstream os;
 			os << "{\"self\":" << SelfSeat()
 			   << ",\"isHost\":" << (SelfSeat() == 0 ? "true" : "false")
 	   << ",\"launchSeat\":" << LaunchSeat()
 			   << ",\"ready\":[" << ready0 << ',' << ready1 << ']'
 			   << ",\"bothReady\":" << ((ready0 && ready1) ? "true" : "false")
-			   << ",\"deckMain\":" << g_deckMain
+			   << ",\"playerCount\":" << playerCount
+			   << ",\"players\":[";
+			{
+				bool first = true;
+				auto add = [&os, &first](int pos, int state) {
+					if (state < 0) return;
+					if (!first) os << ',';
+					first = false;
+					os << "{\"pos\":" << pos << ",\"state\":" << state
+					   << ",\"ready\":" << ((state == 9) ? "true" : "false") << '}';
+				};
+				add(0, state0);
+				add(1, state1);
+			}
+			os << "],\"deckMain\":" << g_deckMain
 			   << ",\"statuses\":[";
 			for (size_t i = 0; i < g_hsStatuses.size(); ++i) { if (i) os << ','; os << g_hsStatuses[i]; }
 			os << "]}";
@@ -1862,6 +1900,10 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 		g_tpPromptActive.store(false);
 		g_sidePending.store(false);
 		g_sidePromptActive.store(false);
+		// task-38: a new game must not show a resume journal from the previous one
+		g_resumePresent = false;
+		g_resumePendingPrompt.clear();
+		Control::Log("RESUME cleared on duel start (new game)");
 		// task-36: record how long we waited for the opponent before this game started
 		if (g_sideWaiting.load() && g_sideWaitSince.load()) {
 			const uint64_t waited = GetTickCount64() - g_sideWaitSince.load();
@@ -2024,6 +2066,9 @@ void Control::OnChat(uint16_t player_type, const uint16_t* msg, size_t len) {
 }
 void Control::OnCtosPacket(unsigned char proto) {
 	g_ctosCount.fetch_add(1); // task-18: proves the client really sent a response
+	// task-38: only CTOS_RESPONSE answers a prompt. Other CTOS (TIME_CONFIRM, TP_RESULT, chat...)
+	// must NOT be mistaken for "the client already responded during analyze".
+	if (proto == CTOS_RESPONSE) g_ctosResponseCount.fetch_add(1);
 	std::lock_guard<std::mutex> lk(g_mutex);
 	g_ctosRing.push_back((int)proto);
 	while (g_ctosRing.size() > kStocRingMax) g_ctosRing.pop_front();
@@ -2042,6 +2087,7 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 	// If the count grows during ClientAnalyze the message answered itself (e.g. MSG_SELECT_CHAIN with
 	// count==0 auto-sends -1) and must NOT be published as a prompt to the policy.
 	g_ctosAtMsgBegin.store(g_ctosCount.load());
+	g_ctosRespAtMsgBegin.store(g_ctosResponseCount.load());
 	// task-28j: raw SELECT_CHAIN header, to compare with what the client's handler sees
 	// (layout: type u8, selecting_player u8, count u8, specount u8, hint0 i32, hint1 i32, ...)
 	if (msgId == MSG_SELECT_CHAIN && len >= 4) {
@@ -2167,11 +2213,14 @@ void Control::OnAnalyzeEnd() {
 	// handled -> publishing it would make the policy send a duplicate response.  Two detectors:
 	//   1) CTOS count grew (SendResponse() now also notifies OnCtosPacket)
 	//   2) MSG_SELECT_CHAIN with count==0 and specount!=0x7f: the client's handler auto-declines
-	const bool ctosGrew = g_ctosCount.load() > g_ctosAtMsgBegin.load();
+	const bool ctosGrew = g_ctosResponseCount.load() > g_ctosRespAtMsgBegin.load();
+	const uint64_t respDelta = g_ctosResponseCount.load() - g_ctosRespAtMsgBegin.load();
 	const int curMsg = mainGame ? (int)mainGame->dInfo.curMsg : 0;
 	const bool chainAutoDecline = (curMsg == MSG_SELECT_CHAIN && g_lastChainRawCount.load() == 0 &&
 		g_lastChainRawSpecount.load() != 0x7f);
-	const bool autoHandled = ctosGrew || chainAutoDecline;
+	// task-38: trust REAL CTOS_RESPONSE only. The old chainAutoDecline shortcut could skip a prompt
+	// whose auto-decline branch did not run (chain mode/forced state), leaving nobody to answer.
+	const bool autoHandled = ctosGrew;
 	// task-28h: remember that the prompt candidates must be captured on the UI thread right now
 	// (dField.activatable_* is UI-thread state; it may be cleared by the next prompt before publish).
 	if (mainGame && IsPromptMsg(curMsg)) {
@@ -2189,9 +2238,10 @@ void Control::OnAnalyzeEnd() {
 			handCodes += b;
 			for (unsigned t : kHandTraps) if (code == t) { ++handTraps; break; }
 		}
-		Control::Log("CHAIN analyze curMsg=%d rawCount=%d specount=%d activatable=%zu descs=%zu autoHandled=%d hand=[%s] handTraps=%d",
+		Control::Log("CHAIN analyze curMsg=%d rawCount=%d specount=%d activatable=%zu descs=%zu autoHandled=%d respDelta=%llu hand=[%s] handTraps=%d",
 			curMsg, g_lastChainRawCount.load(), g_lastChainRawSpecount.load(),
 			f.activatable_cards.size(), f.activatable_descs.size(), autoHandled ? 1 : 0,
+			(unsigned long long)respDelta,
 			handCodes.c_str(), handTraps);
 		if (!autoHandled) g_chainCaptureWanted.store(true);
 	}

@@ -234,15 +234,20 @@ static bool SyncDeckCombo(const std::string& name) {
 // Execute one lobby/deck action (Ready / Deck / Surrender / Start / NotReady / Join).
 // Verbatim move of the former ExecuteAction cases; none of them is UI-handled.
 // ---------------------------------------------------------------------------
+// task-37: /ready and /start are retried by the runner; count the attempts for the logs.
+static int g_readyAttempt = 0;
+static int g_startAttempt = 0;
 bool ExecLobbyAction(const Action& a) {
 	switch (a.kind) {
 	case ActionKind::Ready: {
-		if (g_readySent) { Control::Log("ready: already sent, skipping"); break; }
-		Control::Log("ready: enter (connected=%d)", DuelClient::IsConnected() ? 1 : 0);
+		// task-37: /ready is retried by the runner until the server marks us ready, so every
+		// request must perform a real attempt. g_readySent is only an informational flag.
 		if (!DuelClient::IsConnected()) {
-			Control::Log("ready: skipped, not connected");
+			Control::Log("ready: attempt not connected");
 			break;
 		}
+		const int attempt = ++g_readyAttempt;
+		Control::Log("ready: attempt #%d (connected=1)", attempt);
 		// task-29a: if the prepare window is up, do what a human does: select the deck combo, then
 		// press the real ready button (its handler loads the deck and sends UpdateDeck + HS_READY).
 		if (mainGame->btnHostPrepReady && mainGame->btnHostPrepReady->isVisible() &&
@@ -251,7 +256,7 @@ bool ExecLobbyAction(const Action& a) {
 			const int catSel = (int)mainGame->cbCategorySelect->getSelected();
 			const int deckSel = (int)mainGame->cbDeckSelect->getSelected();
 			if (catSel >= 0 && deckSel >= 0) {
-				Control::Log("ready: clicking HP_READY via UI (cat=%d deck=%d)", catSel, deckSel);
+				Control::Log("ready: attempt #%d (clicked cat=%d deck=%d)", attempt, catSel, deckSel);
 				ClickGuiButton(mainGame->btnHostPrepReady);
 				g_readySent = true;
 				break;
@@ -304,7 +309,7 @@ bool ExecLobbyAction(const Action& a) {
 				g_deckExtra = (int)deckManager.current_deck.extra.size();
 			}
 		}
-		Control::Log("ready: sending HS_READY");
+		Control::Log("ready: attempt #%d (sent direct) main=%d", attempt, (int)deckManager.current_deck.main.size());
 		DuelClient::SendPacketToServer(CTOS_HS_READY);
 		g_readySent = true;
 		Control::Log("ready: done");
@@ -419,14 +424,29 @@ bool ExecLobbyAction(const Action& a) {
 			Control::Log("start: skipped, not connected");
 			break;
 		}
-		Control::Log("start: sending HS_START");
-		DuelClient::SendPacketToServer(CTOS_HS_START);
+		if (mainGame->dInfo.isStarted) {
+			Control::Log("start: attempt skipped (already started)");
+			break;
+		}
+		{
+			const int attempt = ++g_startAttempt;
+			Control::Log("start: sent HS_START #%d", attempt);
+			DuelClient::SendPacketToServer(CTOS_HS_START);
+		}
 		break;
 	case ActionKind::NotReady:
 		if (!DuelClient::IsConnected()) break;
 		DuelClient::SendPacketToServer(CTOS_HS_NOTREADY);
 		break;
 	case ActionKind::Join: {
+		// task-37: fresh room -> drop stale HS statuses and attempt counters
+		g_readySent = false;
+		g_readyAttempt = 0;
+		g_startAttempt = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			g_hsStatuses.clear();
+		}
 		// The join packet is built from the LAN-window edit boxes, so fill those first.
 		auto toW = [](const std::string& s) {
 			std::wstring w;
@@ -486,6 +506,13 @@ bool ExecLobbyAction(const Action& a) {
 		// task-28: cleanly leave the current room and return to the main menu (used by supervisor
 		// before it restarts the client).  Best effort on the widgets: some may not exist yet.
 		Control::Log("leave: StopClient(EXIT) + reset dInfo");
+		g_readySent = false;
+		g_readyAttempt = 0;
+		g_startAttempt = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			g_hsStatuses.clear();
+		}
 		if (mainGame) {
 			auto hide = [](irr::gui::IGUIWindow* w) {
 				if (w && w->isVisible()) mainGame->HideElement(w);
