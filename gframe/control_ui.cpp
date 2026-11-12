@@ -93,11 +93,21 @@ void ApplyChainMode(const char* why) {
  * bit0=wPosSelect(表示形式) 1=wOptions 2=wCardSelect 3=wCmdMenu 4=wMessage.
  */
 void UiCleanup(const char* why) {
+	// task-41: never hide a window that is still waiting for an answer (the network thread may be
+	// blocked on actionSignal.Wait(); hiding it made the prompt invisible AND unanswered).
+	const int pendingKind = PendingUiKind();
+	if (pendingKind) {
+		static int lastLogged = -1;
+		if (lastLogged != pendingKind) {
+			lastLogged = pendingKind;
+			Control::Log("UI cleanup skipped kind=query pendingKind=%d (%s)", pendingKind, why);
+		}
+	}
 	unsigned bits = 0;
-	if (mainGame->wPosSelect && mainGame->wPosSelect->isVisible()) { mainGame->HideElement(mainGame->wPosSelect); bits |= 0x01; }
-	if (mainGame->wOptions && mainGame->wOptions->isVisible()) { mainGame->HideElement(mainGame->wOptions); bits |= 0x02; }
-	if (mainGame->wCardSelect && mainGame->wCardSelect->isVisible()) { mainGame->HideElement(mainGame->wCardSelect); bits |= 0x04; }
-	if (mainGame->wCmdMenu && mainGame->wCmdMenu->isVisible()) { mainGame->HideElement(mainGame->wCmdMenu); bits |= 0x08; }
+	if (!pendingKind && mainGame->wPosSelect && mainGame->wPosSelect->isVisible()) { mainGame->HideElement(mainGame->wPosSelect); bits |= 0x01; }
+	if (!pendingKind && mainGame->wOptions && mainGame->wOptions->isVisible()) { mainGame->HideElement(mainGame->wOptions); bits |= 0x02; }
+	if (!pendingKind && mainGame->wCardSelect && mainGame->wCardSelect->isVisible()) { mainGame->HideElement(mainGame->wCardSelect); bits |= 0x04; }
+	if (!pendingKind && mainGame->wCmdMenu && mainGame->wCmdMenu->isVisible()) { mainGame->HideElement(mainGame->wCmdMenu); bits |= 0x08; }
 	if (mainGame->wMessage && mainGame->wMessage->isVisible()) {
 		mainGame->HideElement(mainGame->wMessage);
 		mainGame->actionSignal.Set(); // MSG_RETRY / hint boxes block the network thread on this
@@ -112,7 +122,7 @@ void UiCleanup(const char* why) {
 			if (w && w->isVisible()) { mainGame->HideElement(w); extra |= (1u << bit); }
 		};
 		hideWin(0, mainGame->wACMessage);
-		hideWin(1, mainGame->wQuery);
+		if (!pendingKind) hideWin(1, mainGame->wQuery); // task-41: keep the pending query visible
 		hideWin(2, mainGame->wCardDisplay);
 		hideWin(3, mainGame->wANNumber);
 		hideWin(4, mainGame->wANCard);
@@ -429,7 +439,7 @@ static bool TryUiSemantic(const Action& a) {
 		Control::Log("UI skip (not ready) kind=%s", a.semKind.c_str());
 		return false;
 	}
-	const int msg = (int)mainGame->dInfo.curMsg;
+	const int msg = g_pendingUiKind.load() ? g_pendingUiKind.load() : (int)mainGame->dInfo.curMsg;
 	auto* f = &mainGame->dField;
 	const auto* k = a.semKind.c_str();
 	auto ok = [&](const char* target, int extra) {

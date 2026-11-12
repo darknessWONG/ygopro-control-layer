@@ -212,6 +212,10 @@ struct Snapshot {
 	std::string lastMsgHex;
 	std::vector<int> recentMsgs; // last N game-message ids (oldest first)
 	SideSnap side;               // task-36: Bo3 side-decking view
+	// task-41: pending UI query whose prompt id was overwritten by a later message
+	// (e.g. curMsg=MSG_WAITING while wQuery/wCardSelect is still waiting for our answer)
+	int pendingKind{ -1 };       // effective prompt id (12/13/14/15/16/19...) or -1
+	int realCurMsg{ -1 };        // dInfo.curMsg when the pending query was detected
 };
 
 // control_sem.cpp: one semantic action offered to the LLM for the current prompt.
@@ -476,6 +480,11 @@ void ApplyChainMode(const char* why);
 void UiCleanup(const char* why);
 void CloseEmptyFrames();
 void LogVisibleWindows();
+// task-41: detect a prompt still waiting in the UI even though dInfo.curMsg was overwritten by a
+// later message (returns effective prompt msg id, or 0 when nothing is pending)
+int PendingUiKind();
+extern std::atomic<int> g_pendingUiKind;
+extern std::atomic<uint64_t> g_lastActQueuedTick; // task-41: debounce pending-query re-publish
 // task-29a: click an existing widget through the normal GUI event path (same as a human click).
 // void* so this header stays independent of the irrlicht includes; the caller passes an IGUIElement*.
 bool ClickGuiButton(void* widget);

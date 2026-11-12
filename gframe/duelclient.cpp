@@ -842,11 +842,20 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		std::wcsftime(timetext, sizeof timetext / sizeof timetext[0], L"%Y-%m-%d %H-%M-%S", std::localtime(&starttime));
 		mainGame->ebRSName->setText(timetext);
 		if(!mainGame->chkAutoSaveReplay->isChecked()) {
-			mainGame->wReplaySave->setText(dataManager.GetSysString(1340));
-			mainGame->PopupElement(mainGame->wReplaySave);
-			mainGame->gMutex.unlock();
-			mainGame->replaySignal.Reset();
-			mainGame->replaySignal.Wait();
+			if (Control::SkipReplayDialog()) {
+				// task-43: never block the network thread on replaySignal.Wait() in automation.
+				// The previous approach (Pump clicking btnRSNo) raced with Reset()+Wait() and could
+				// block forever -> no more STOCs -> srvpro kicked us for AFK (eof).
+				mainGame->actionParam = 0;
+				mainGame->gMutex.unlock();
+				Control::Log("replay: dialog skipped (control-driven, no wait)");
+			} else {
+				mainGame->wReplaySave->setText(dataManager.GetSysString(1340));
+				mainGame->PopupElement(mainGame->wReplaySave);
+				mainGame->gMutex.unlock();
+				mainGame->replaySignal.Reset();
+				mainGame->replaySignal.Wait();
+			}
 		}
 		else {
 			mainGame->actionParam = 1;

@@ -227,6 +227,10 @@ std::string PromptJson(const Snapshot& s) {
 	std::ostringstream os;
 	os << "{\"seq\":" << g_seq << ",\"curMsg\":" << s.curMsg << ",\"turn\":" << s.turn
 	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false");
+	// task-41: report when the effective prompt came from a still-visible UI query
+	if (s.pendingKind > 0) {
+		os << ",\"pendingKind\":" << s.pendingKind << ",\"realCurMsg\":" << s.realCurMsg;
+	}
 	// task-34: first/second choice is exposed as its own prompt
 	if (g_tpPromptActive.load()) {
 		os << ",\"tpPending\":true,\"tpOptions\":[1,2],\"tpChooseBy\":\"act_id kind=tp index=1|2\"";

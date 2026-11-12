@@ -60,6 +60,8 @@ public:
 	// task-35: Bo3 side-decking state (STOC_CHANGE_SIDE / STOC_WAITING_SIDE)
 	static void OnChangeSide();
 	static void OnWaitingSide();
+	// task-43: control-driven runs must never block on the "save replay?" dialog
+	static bool SkipReplayDialog();
 	// record HS player-change status bytes (pos<<4 | state, state 9=READY 10=NOTREADY)
 	static void OnHsChange(unsigned char status);
 	// append a line to control.log (crash / flow diagnostics)

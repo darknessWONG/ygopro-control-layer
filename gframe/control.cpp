@@ -92,6 +92,25 @@ bool IsPromptMsg(int id) {
 	return false;
 }
 
+// task-41/42: the client may still be waiting on a UI query while dInfo.curMsg was overwritten by a
+// later message (e.g. MSG_WAITING). Detect the waiting window from the live UI state.
+std::atomic<int> g_pendingUiKind{ 0 };
+std::atomic<uint64_t> g_lastActQueuedTick{ 0 };
+static std::atomic<uint64_t> g_lastPendingSig{ 0 };
+static std::atomic<uint64_t> g_lastPendingSigTick{ 0 };
+int PendingUiKind() {	if (!mainGame || !mainGame->device || !mainGame->dInfo.isInDuel) return 0;
+	// task-44: only MSG_WAITING(3) legitimately hides an outstanding prompt id. Any other
+	// non-prompt message (START/WIN/MOVE/UPDATE_DATA/...) must NEVER be answered with a synthetic
+	// response: that was seen as a protocol error -> srvpro eof kicks.
+	if ((int)mainGame->dInfo.curMsg != MSG_WAITING) return 0;
+	// require a prompt window that is actually visible (stale dField data is NOT enough)
+	if (mainGame->wQuery && mainGame->wQuery->isVisible()) return MSG_SELECT_YESNO;
+	if (mainGame->wCardSelect && mainGame->wCardSelect->isVisible()) return MSG_SELECT_CARD;
+	if (mainGame->wOptions && mainGame->wOptions->isVisible()) return MSG_SELECT_OPTION;
+	if (mainGame->wPosSelect && mainGame->wPosSelect->isVisible()) return MSG_SELECT_POSITION;
+	return 0;
+}
+
 
 std::mutex g_mutex;
 std::condition_variable g_cv;
@@ -222,7 +241,45 @@ const char* StocName(int id) {
 	}
 }
 
-// MSG_WIN reason values: the ocgcore itself only writes two generic causes
+// task-44: engine message names for triage logs (subset that matters for prompts/notifications)
+const char* MsgName(int id) {
+	switch (id) {
+	case 2: return "MSG_HINT";
+	case 3: return "MSG_WAITING";
+	case 4: return "MSG_START";
+	case 5: return "MSG_WIN";
+	case 6: return "MSG_UPDATE_DATA";
+	case 10: return "MSG_SELECT_BATTLECMD";
+	case 11: return "MSG_SELECT_IDLECMD";
+	case 12: return "MSG_SELECT_EFFECTYN";
+	case 13: return "MSG_SELECT_YESNO";
+	case 14: return "MSG_SELECT_OPTION";
+	case 15: return "MSG_SELECT_CARD";
+	case 16: return "MSG_SELECT_CHAIN";
+	case 18: return "MSG_SELECT_PLACE";
+	case 19: return "MSG_SELECT_POSITION";
+	case 20: return "MSG_SELECT_TRIBUTE";
+	case 23: return "MSG_SELECT_SUM";
+	case 24: return "MSG_SELECT_DISFIELD";
+	case 25: return "MSG_SORT_CARD";
+	case 26: return "MSG_SELECT_UNSELECT_CARD";
+	case 31: return "MSG_CONFIRM_CARDS";
+	case 40: return "MSG_NEW_TURN";
+	case 41: return "MSG_NEW_PHASE";
+	case 50: return "MSG_MOVE";
+	case 53: return "MSG_POS_CHANGE";
+	case 70: return "MSG_CHAINING";
+	case 71: return "MSG_CHAINED";
+	case 72: return "MSG_CHAIN_SOLVING";
+	case 73: return "MSG_CHAIN_SOLVED";
+	case 74: return "MSG_CHAIN_END";
+	case 83: return "MSG_BECOME_TARGET";
+	case 90: return "MSG_DRAW";
+	case 110: return "MSG_?110";
+	default: return "MSG_?";
+	}
+}
+
 //   processor.cpp adjust_step(): rea=1 -> LP reached 0, rea=2 -> deck-out (overdraw)
 // plus Lua Duel.Win(player, reason) (libduel.cpp) whose `reason` is the WIN_REASON_*
 // constant from the card scripts.  Names below come from CardScripts/constant.lua
@@ -1383,6 +1440,7 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 					// task-36: from this moment we are waiting for the opponent's confirmation
 					SideMarkWaiting();
 					g_awaiting = false;
+					g_lastActQueuedTick.store(GetTickCount64());
 				}
 				body = "{\"ok\":true,\"queued\":true,\"kind\":\"side_ok\"}";
 			} else if (g_sidePending.load()) {
@@ -1406,6 +1464,7 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 					g_tpPromptActive.store(false);
 					g_tpPending.store(false);
 					g_awaiting = false;
+					g_lastActQueuedTick.store(GetTickCount64());
 				}
 				body = "{\"ok\":true,\"queued\":true,\"kind\":\"tp\",\"index\":" + std::to_string(res) + "}";
 			} else {
@@ -1418,10 +1477,18 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			{
 				std::lock_guard<std::mutex> lk(g_mutex);
 				if (!g_awaiting) { body = "{\"ok\":false,\"error\":\"not awaiting\"}"; return body; }
-				auto acts = BuildSemActions(g_shared);
+				// task-41: use the frozen prompt snapshot (it may carry a pendingKind override when
+				// dInfo.curMsg was overwritten by a later message).
+				const Snapshot& cur = g_promptSnapValid.load() ? g_promptSnap : g_shared;
+				auto acts = BuildSemActions(cur);
 				if (id < 0 || id >= (int)acts.size()) { body = "{\"ok\":false,\"error\":\"bad action id\"}"; return body; }
-				ok = EncodeSemAction(g_shared, acts[id], ival, bytes, err);
+				ok = EncodeSemAction(cur, acts[id], ival, bytes, err);
 				if (ok) {
+					// task-42: make the effective (real vs synthetic) message ids visible for triage
+					Control::Log("SEND RESPONSE realMsg=%d(%s) synthMsg=%d(%s) len=%d i=%d",
+						(cur.pendingKind > 0 ? cur.realCurMsg : cur.curMsg),
+						MsgName(cur.pendingKind > 0 ? cur.realCurMsg : cur.curMsg),
+						cur.curMsg, MsgName(cur.curMsg), (int)bytes.size(), ival);
 					act.i = ival;
 					act.bytes = bytes;
 					if (g_uiActions) {
@@ -1437,6 +1504,9 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 					}
 					g_actions.push_back(act);
 					g_awaiting = false;
+					g_pendingUiKind.store(0);
+					g_promptSnapValid.store(false);
+					g_lastActQueuedTick.store(GetTickCount64());
 				}
 			}
 			if (!ok) { body = "{\"ok\":false,\"error\":\"" + err + "\"}"; }
@@ -1765,6 +1835,7 @@ void Control::NotifyUserText(const wchar_t* text, const char* tag) { ctl::Notify
 void Control::OnDeckError(unsigned type, unsigned code, const char* text) { ctl::OnDeckErrorImpl(type, code, text); }
 void Control::OnChangeSide() { ctl::OnChangeSideImpl(); }
 void Control::OnWaitingSide() { ctl::OnWaitingSideImpl(); }
+bool Control::SkipReplayDialog() { return ctl::g_controlDriven.load(); }
 
 void Control::EnsureStarted() {
 	static std::once_flag once;
@@ -1913,6 +1984,7 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 		}
 		g_sideWaiting.store(false);
 		g_sideWaitSince.store(0);
+		g_pendingUiKind.store(0); // task-41: new game has no pending UI query
 		const int game = g_matchGame.fetch_add(1) + 1;
 		Control::Log("DUEL_START reset result state (match game %d) winPlayer=-1 awaiting=0 tp=0 side=0", game);
 		Control::Log("STOC_DUEL_START -> chain mode pending (%s)", ChainModeName(g_chainMode.load()));
@@ -2322,9 +2394,18 @@ void Control::Pump() {
 		if (g_controlDriven.load() && mainGame->wReplaySave && mainGame->wReplaySave->isVisible() &&
 			mainGame->btnRSNo && replayTick - lastReplaySkipTick >= 1000) {
 			lastReplaySkipTick = replayTick;
-			Control::Log("UI auto-confirm kind=replay-save (skip save) curMsg=%d",
-				(int)mainGame->dInfo.curMsg);
+			const bool stalled = SinceTickMs(g_lastAnalyzeTick, replayTick) > 1000;
+			Control::Log("UI auto-confirm kind=replay-save (skip save) curMsg=%d stalled=%d",
+				(int)mainGame->dInfo.curMsg, stalled ? 1 : 0);
 			ClickGuiButton(mainGame->btnRSNo);
+			// task-43: click alone can race with Reset()+Wait(); signal unconditionally so an early
+			// click cannot be swallowed (this used to block the network thread forever -> eof).
+			mainGame->replaySignal.Set();
+			Control::Log("replay: signalled after skip-save");
+			if (stalled) {
+				Control::Log("replay: retry skip (analyze stalled)");
+				mainGame->replaySignal.Set();
+			}
 		}
 	}
 	if (g_chainCaptureWanted.exchange(false)) CaptureChainAnalyze();
@@ -2335,6 +2416,7 @@ void Control::Pump() {
 		std::lock_guard<std::mutex> lk(g_mutex);
 		g_shared = std::move(s);
 		if (prompt) {
+			g_pendingUiKind.store(0);
 			++g_seq;
 			g_awaiting = true;
 			// task-28f: freeze the prompt state. Messages that arrive afterwards (MSG_WAITING etc.)
@@ -2386,6 +2468,53 @@ void Control::Pump() {
 				(unsigned long long)g_seq, fresh.side.mainCount, fresh.side.extraCount,
 				fresh.side.sideCount);
 			g_cv.notify_all();
+		}
+	}
+	// task-41: a UI query can still be waiting while curMsg was overwritten by a later message
+	// (MSG_WAITING etc.). Publish a synthetic prompt from the live UI state so /actions works.
+	if (!g_awaiting && !g_tpPromptActive.load() && !g_sidePromptActive.load()) {
+		const int pendingKind = PendingUiKind();
+		bool actionsBusy = false;
+		{
+			std::lock_guard<std::mutex> lk(g_mutex);
+			actionsBusy = !g_actions.empty();
+		}
+		const uint64_t lastAct = g_lastActQueuedTick.load();
+		const bool debounceOk = lastAct == 0 || GetTickCount64() - lastAct > 500;
+		if (pendingKind && !actionsBusy && debounceOk) {
+			Snapshot fresh;
+			SnapshotFromClient(fresh);
+			// task-42: dedupe identical pending signatures (same real msg + selection + turn/phase).
+			// Without it the prompt was re-published every frame (73x/s) and policy kept answering.
+			uint64_t sig = ((uint64_t)(uint32_t)fresh.curMsg << 32) ^
+				((uint64_t)(uint32_t)pendingKind << 24) ^
+				((uint64_t)(uint32_t)fresh.selectMin << 16) ^
+				((uint64_t)(uint32_t)fresh.selectableList.size() << 8) ^
+				((uint64_t)(uint32_t)fresh.turn << 4) ^ (uint64_t)(uint32_t)fresh.phase;
+			const uint64_t nowSig = GetTickCount64();
+			if (g_lastPendingSig.load() == sig && nowSig - g_lastPendingSigTick.load() < 5000) {
+				Control::Log("PROMPT dedupe skip (same pending signature sig=%llu)", (unsigned long long)sig);
+			} else {
+				std::lock_guard<std::mutex> lk(g_mutex);
+				if (!g_awaiting) {
+					g_lastPendingSig.store(sig);
+					g_lastPendingSigTick.store(nowSig);
+					const int realCurMsg = fresh.curMsg;
+					fresh.pendingKind = pendingKind;
+					fresh.realCurMsg = realCurMsg;
+					fresh.curMsg = pendingKind; // effective prompt id drives /actions + encoding
+					g_shared = fresh;
+					g_promptSnap = fresh;
+					g_promptSnapValid.store(true);
+					g_pendingUiKind.store(pendingKind);
+					++g_seq;
+					g_awaiting = true;
+					Control::Log("PROMPT publish from pending query (realCurMsg=%d(%s) pendingKind=%d(%s) selectMin=%d selectable=%zu sig=%llu)",
+						realCurMsg, MsgName(realCurMsg), pendingKind, MsgName(pendingKind),
+						fresh.selectMin, fresh.selectableList.size(), (unsigned long long)sig);
+					g_cv.notify_all();
+				}
+			}
 		}
 	}
 	// task-36: while the opponent is still siding, log elapsed time periodically (do not exit)
