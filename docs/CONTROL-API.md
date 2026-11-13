@@ -128,6 +128,7 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
 | 字段 | 说明 |
 |---|---|
 | `seq` `curMsg` `turn` `awaiting` | 当前 prompt 的序号/消息类型/回合/是否待答 |
+| `pendingKind` `realCurMsg` | **仅当 prompt 由"仍在等待的 UI 查询"合成时出现**：`realCurMsg` 是被后续消息覆盖的真实 `dInfo.curMsg`（通常 3=WAITING），`pendingKind` 是实际等待的查询类型（13=YESNO/EFFECTYN、15=SELECT_CARD、14=OPTION、19=POSITION）；正常 prompt 无这两个字段 |
 | `tpPending` `tpOptions` `tpChooseBy` | **仅先/后攻选择时出现**（见 §3.5）；`tpOptions:[1,2]`，1=先攻、2=后攻 |
 | `summonable` `spsummonable` `msetable` `ssetable` `reposable` `activatable` `attackable` | 各类可动作数量 |
 | `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,op,lv,rk,ty,desc,ctrl,forced}` |
@@ -208,9 +209,10 @@ Bo3 的 `Game1 → Game2` 之间服务端会发 `STOC_CHANGE_SIDE`（进 siding 
   main/extra/side 数量不变 → `SendUpdateDeck`），日志 `SIDE ok clicked (from control)`；
   随后服务端 `STOC_WAITING_SIDE`（等对手）会清掉 pending，下一局重新 `/ready` 即可。
 - 纯手动（从未有 HTTP 请求）不发布该 prompt，原 siding UI 行为不变。
-- **重要**：每局结束服务端会发 `STOC_REPLAY`（回放），若客户端"自动保存回放"未勾选会弹保存框并把
-  网络线程阻塞在 `replaySignal.Wait()`，导致其后的 `STOC_CHANGE_SIDE` 收不到。控制驱动模式下控制层会
-  自动点"不保存"（日志 `UI auto-confirm kind=replay-save (skip save)`），保证换备包继续处理。
+- **重要**：每局结束服务端可能发 `STOC_REPLAY`（回放），若"自动保存回放"未勾选，原版会弹保存框并把
+  网络线程阻塞在 `replaySignal.Wait()`，导致其后的 `STOC_CHANGE_SIDE` 收不到。**控制驱动模式下控制层直接
+  跳过该对话框、不阻塞网络线程**（日志 `replay: dialog skipped (control-driven, no wait)`；纯手动仍弹框）；
+  另有兜底 `replay: signalled after skip-save` / `replay: retry skip (analyze stalled)`。
 
 #### 3.5.1.1 `/state.side`（换备信息）
 
