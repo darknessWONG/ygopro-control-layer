@@ -310,6 +310,19 @@ extern int g_phase;
 extern int g_winPlayer;
 extern int g_winPlayerLocal; // raw winner mapped to local view (0=me, 1=opponent, -1 draw/unknown)
 extern int g_winReason;
+// task-45: per-game results of the current match (Bo3), for /state.match
+struct GameResult {
+	int game;         // 1-based game number (STOC_DUEL_START counter)
+	int winnerLocal;  // 0=me, 1=opponent, -1=draw/unknown
+	int winnerSeat;   // raw seat id (0/1), -1=unknown (debug only)
+	int reason;       // raw MSG_WIN reason
+};
+extern GameResult g_gameResults[8];
+extern int g_gameResultCount;
+extern bool g_matchOver; // set by STOC_DUEL_END
+// task-46: true only after an actual STOC_DUEL_START was received. Do NOT use dInfo.isStarted here:
+// the client sets that when the host merely clicks Start, so /start used to latch and stop retrying.
+extern std::atomic<bool> g_duelObservedStart;
 extern bool g_readySent;
 extern std::atomic<bool> g_snapshotWanted;
 extern bool g_promptWanted;

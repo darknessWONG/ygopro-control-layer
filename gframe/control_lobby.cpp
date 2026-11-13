@@ -424,13 +424,13 @@ bool ExecLobbyAction(const Action& a) {
 			Control::Log("start: skipped, not connected");
 			break;
 		}
-		if (mainGame->dInfo.isStarted) {
-			Control::Log("start: attempt skipped (already started)");
+		if (g_duelObservedStart.load()) {
+			Control::Log("start: skipped (duel already started)");
 			break;
 		}
 		{
 			const int attempt = ++g_startAttempt;
-			Control::Log("start: sent HS_START #%d", attempt);
+			Control::Log("start: HS_START sent #%d", attempt);
 			DuelClient::SendPacketToServer(CTOS_HS_START);
 		}
 		break;

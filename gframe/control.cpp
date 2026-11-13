@@ -137,6 +137,12 @@ int g_phase = -1;
 int g_winPlayer = -1;
 int g_winPlayerLocal = -1; // task-28g: raw winner mapped to local view (0=me, 1=opponent, -1 unknown/draw)
 int g_winReason = -1;
+// task-45: per-game results of the current match (Bo3)
+GameResult g_gameResults[8]{};
+int g_gameResultCount = 0;
+bool g_matchOver = false;
+// task-46: set only when STOC_DUEL_START actually arrives (not when the host clicks Start)
+std::atomic<bool> g_duelObservedStart{ false };
 bool g_readySent = false;
 std::atomic<bool> g_snapshotWanted{ false };
 bool g_promptWanted = false;
@@ -1198,6 +1204,7 @@ void SideMarkWaiting() {
 void OnChangeSideImpl() {
 	// task-35d: always log arrival (manual or driven) so LAN/ranked Bo3 can be diagnosed
 	Control::Log("STOC_CHANGE_SIDE received (controlDriven=%d)", g_controlDriven.load() ? 1 : 0);
+	g_duelObservedStart.store(false); // task-46: Game2 needs a fresh HS_START
 	g_snapshotWanted.store(true); // task-36: build the side lists for /state.side
 	// task-36: a new siding window resets the sticky waiting diagnostics
 	g_sideWaitingSeen.store(false);
@@ -1205,6 +1212,23 @@ void OnChangeSideImpl() {
 	if (!g_controlDriven.load()) return; // manual play keeps the original siding UI
 	g_sidePending.store(true);
 	g_sideWaiting.store(false);
+	// task-47: LAN/verification convenience: YGO_SIDE_AUTO=1 answers the siding prompt by itself
+	// (ranked keeps the LLM-driven side_ok; the env is absent there).
+	if (const char* sa = std::getenv("YGO_SIDE_AUTO")) {
+		if (std::atoi(sa) != 0) {
+			Action a;
+			a.kind = ActionKind::SideOk;
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				g_actions.push_back(std::move(a));
+				g_awaiting = false;
+				g_promptSnapValid.store(false);
+			}
+			Control::Log("SIDE auto-ok queued (YGO_SIDE_AUTO=1)");
+			g_cv.notify_all();
+			return;
+		}
+	}
 	// task-36c: the siding window supersedes any older prompt/awaiting state; otherwise the
 	// synthetic side prompt would never publish (Pump requires awaiting==false).
 	{
@@ -1957,6 +1981,7 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 	// stoc hook is off (host runs with YGO_HOOKS=msganalyze).
 	if (pktType == STOC_DUEL_START) {
 		g_applyChainPending.store(true);
+		g_duelObservedStart.store(true); // task-46: only a real DUEL_START completes /start
 		// task-35f: a new game in a match (Bo3 Game2/3) must not inherit Game1's result/pending
 		// state, otherwise /state.winPlayer stays at the previous winner and policy exits at once.
 		{
@@ -1986,6 +2011,13 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 		g_sideWaitSince.store(0);
 		g_pendingUiKind.store(0); // task-41: new game has no pending UI query
 		const int game = g_matchGame.fetch_add(1) + 1;
+		if (game == 1) {
+			// task-45: first game of a match -> clear previous match results
+			g_gameResultCount = 0;
+			g_matchOver = false;
+			std::memset(g_gameResults, 0, sizeof g_gameResults);
+			Control::Log("MATCH new: game results cleared (game 1)");
+		}
 		Control::Log("DUEL_START reset result state (match game %d) winPlayer=-1 awaiting=0 tp=0 side=0", game);
 		Control::Log("STOC_DUEL_START -> chain mode pending (%s)", ChainModeName(g_chainMode.load()));
 	}
@@ -1996,9 +2028,22 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 		std::lock_guard<std::mutex> lk0(g_mutex); g_errMsg = m; g_errCode = code;
 		Control::Log("STOC_ERROR_MSG msg=%d code=0x%08x", m, code);
 	}
-	if (pktType == STOC_DUEL_END) Control::Log("STOC_DUEL_END");
+	if (pktType == STOC_DUEL_END) {
+		g_matchOver = true; // task-45: /state.match.over
+		g_duelObservedStart.store(false); // task-46: next game needs a fresh /start
+		Control::Log("STOC_DUEL_END (match over, games=%d)", g_gameResultCount);
+	}
 	if (pktType == STOC_SELECT_HAND) Control::Log("STOC_SELECT_HAND");
 	if (pktType == STOC_DUEL_START) Control::Log("STOC_DUEL_START");
+	if (pktType == STOC_JOIN_GAME) {
+		// task-45: a new room/match starts at game 1 with no recorded results
+		g_matchGame.store(0);
+		g_gameResultCount = 0;
+		g_matchOver = false;
+		g_duelObservedStart.store(false); // task-46
+		std::memset(g_gameResults, 0, sizeof g_gameResults);
+		Control::Log("JOIN_GAME: match results reset (next duel = game 1)");
+	}
 	if (pktType == STOC_TIME_LIMIT) {
 		uint8_t who = (data && len >= 1) ? data[0] : 0xFF;
 		int left = (data && len >= 4) ? (int)(data[2] | (data[3] << 8)) : -1;
@@ -2184,6 +2229,18 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 			g_winPlayer = winner;
 			g_winPlayerLocal = (winner <= 1 && mainGame) ? mainGame->LocalPlayer(winner) : -1;
 			g_winReason = reason;
+			// task-45: record this game's result for /state.match (same game overwrites, no dupes)
+			{
+				const int gm = (std::max)(1, (int)g_matchGame.load());
+				if (gm >= 1 && gm <= 8) {
+					const int idx = gm - 1;
+					g_gameResults[idx].game = gm;
+					g_gameResults[idx].winnerLocal = g_winPlayerLocal;
+					g_gameResults[idx].winnerSeat = winner;
+					g_gameResults[idx].reason = reason;
+					if (idx + 1 > g_gameResultCount) g_gameResultCount = idx + 1;
+				}
+			}
 		}
 		// reason: core writes 1 (LP 0) / 2 (deck-out); Lua Duel.Win() writes WIN_REASON_*.
 		// NOTE: `player` is the RAW seat; the local view winner is what callers should read.

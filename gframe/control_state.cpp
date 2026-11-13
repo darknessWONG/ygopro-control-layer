@@ -423,6 +423,36 @@ std::string SnapshotJson(const Snapshot& s) {
 	   << ",\"isDraw\":" << ((g_winPlayer == 2) ? "true" : "false")
 	   << ",\"winReason\":" << g_winReason
 	   << ",\"winReasonName\":\"" << WinReasonName(g_winReason) << '"'
+	   // task-45: whole-match (Bo3) view: per-game results + score + whether the match ended
+	   << ",\"match\":{\"game\":" << g_matchGame.load()
+	   << ",\"over\":" << (g_matchOver ? "true" : "false")
+	   << ",\"games\":[";
+	{
+		bool first = true;
+		int wonLocal = 0, wonOpp = 0;
+		for (int i = 0; i < g_gameResultCount && i < 8; ++i) {
+			const GameResult& gr = g_gameResults[i];
+			if (gr.game <= 0) continue;
+			if (!first) os << ',';
+			first = false;
+			os << "{\"game\":" << gr.game
+			   << ",\"win\":" << ((gr.winnerLocal == 0) ? "true" : "false")
+			   << ",\"winnerSeat\":" << gr.winnerSeat
+			   << ",\"reason\":" << gr.reason
+			   << ",\"reasonName\":\"" << WinReasonName(gr.reason) << "\"}";
+			if (gr.winnerLocal == 0) ++wonLocal; else if (gr.winnerLocal == 1) ++wonOpp;
+		}
+		os << "],\"gamesWonLocal\":" << wonLocal
+		   << ",\"gamesWonOpp\":" << wonOpp;
+		if (g_gameResultCount > 0) {
+			const GameResult& last = g_gameResults[g_gameResultCount - 1];
+			os << ",\"lastWinnerLocal\":" << ((last.winnerLocal == 0) ? "true" : "false")
+			   << ",\"lastReasonName\":\"" << WinReasonName(last.reason) << '"';
+		} else {
+			os << ",\"lastWinnerLocal\":null,\"lastReasonName\":null";
+		}
+	}
+	os << '}'
 	   // UI / chain mode (see bridge/docs/ui-fix.md)
 	   << ",\"chainMode\":" << s.chainMode
 	   << ",\"uiCleanupCount\":" << s.uiCleanupCount

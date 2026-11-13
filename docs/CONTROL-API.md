@@ -85,6 +85,7 @@ curl.exe -s http://127.0.0.1:7788/health
 | 阵营/座位 | `myPlayer`（本地视角恒 0）、`mySeat`（实际座位 0/1）、`turnPlayer`（raw 座位）、`turnPlayerLocal`（本地视角）、`isMyTurn`、`selftype`、`playerType` |
 | 生命/阶段 | `lp:[我方,对手]` + `lpOrder:"local"`、`phase`（数字）、`phaseName`（如 `MAIN1`）、`timeLeft` |
 | 胜负 | `winPlayer`（raw）、`winPlayerLocal`（0=我方赢/1=对手赢/-1=平局或未知）、`isWin` `isLoss` `isDraw`、`winReason` `winReasonName` |
+| 整场（Bo3） | `match:{game,over,games:[{game,win,winnerSeat,reason,reasonName}],gamesWonLocal,gamesWonOpp,lastWinnerLocal,lastReasonName}`：`game`=当前第几局（`STOC_DUEL_START` 计数），`over`=`STOC_DUEL_END` 已收到；`win` 为我方视角，`winnerSeat` 为 raw 座位（0/1，调试用）；无结果时 `lastWinnerLocal/lastReasonName` 为 `null` |
 | 计数 | `counts:{hand:[我,对],grave:[...],remove:[...],deck:[...],extra:[...]}` |
 | 手牌/场面 | `hand`、`monsters`、`spells`、`grave`、`banished`：数组 `[我方, 对手]`；`extraDeck` 单数组；每张卡 `{code,atk,def,pos,faceup,hidden,ty,lv,name,loc,seq}`（`hidden=true` 时 `code/lv/name` 置空） |
 | 连锁 | `chainDepth` `chainStack` `chainingTo` `chainCandidates` `canDecline` `hint` `lastChainEvent`；另有可读的 `activeEffects`（链栈文本）、`continuousEffects`（永续效果卡） |
@@ -108,6 +109,11 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
  "phase":4,"phaseName":"MAIN1","curMsg":11,"myPlayer":0,"mySeat":0,"turnPlayer":0,
  "turnPlayerLocal":0,"isMyTurn":true,"winPlayer":-1,"winPlayerLocal":-1,
  "isWin":false,"isLoss":false,"isDraw":false,"winReason":-1,"winReasonName":"UNKNOWN",
+ "match":{"game":2,"over":false,
+          "games":[{"game":1,"win":true,"winnerSeat":0,"reason":1,"reasonName":"LP_ZERO"},
+                   {"game":2,"win":true,"winnerSeat":0,"reason":4,"reasonName":"DISCONNECT"}],
+          "gamesWonLocal":2,"gamesWonOpp":0,
+          "lastWinnerLocal":true,"lastReasonName":"DISCONNECT"},
  "chainMode":1,"seq":5,"awaiting":true,
  "counts":{"hand":[5,5],"grave":[0,1],"remove":[0,0],"deck":[35,34],"extra":[15,15]},
  "chainDepth":0,"chainStack":[],"chainingTo":null,"chainCandidates":[],"canDecline":true,
@@ -298,7 +304,7 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act?seq=42&i=-1"
 | `GET|POST /join?ip=&port=&pass=` | 连接服务器；缺省 `ip=127.0.0.1`、`port=7911` | `{"ok":true,"queued":true}`；成功后 `/lobby`、`/net.joined` 变化 |
 | `GET|POST /deck?name=<deck>` | 加载 `<游戏目录>/deck/<name>.ydk` 并**在准备界面 `cbDeckSelect` 选中该卡组**（缺省 `Blackwing`） | `{"ok":true,"queued":true}`；日志 `deck: select combo name=... -> confirmed` |
 | `GET|POST /ready` | 准备：准备窗口存在时先同步卡组下拉框，再点真实 `btnHostPrepReady`（=真人流程 `LoadCurrentDeck`+`UpdateDeck`+`CTOS_HS_READY`）；**可安全重试**（每次请求都会重新尝试，点击或直发），日志 `ready: attempt #N (clicked|sent direct)` | `{"ok":true,"queued":true}` |
-| `GET|POST /start` | 房主开始对局（`CTOS_HS_START`）；**可安全重试**（每次请求都会重发，已 started 时跳过），日志 `start: sent HS_START #N` | `{"ok":true,"queued":true}` |
+| `GET|POST /start` | 房主开始对局（`CTOS_HS_START`）；**可安全重试**：每次请求都重发，**只有真正收到 `STOC_DUEL_START` 后才跳过**（不再用 `dInfo.isStarted`，避免点击未生效时被 latch），日志 `start: HS_START sent #N` / `start: skipped (duel already started)` | `{"ok":true,"queued":true}` |
 | `GET|POST /leave` | 离开房间回主菜单（重连/换房用） | `{"ok":true,"queued":true}` |
 | `GET|POST /surrender` | 投降（`CTOS_SURRENDER`） | `{"ok":true,"queued":true}` |
 | `GET|POST /hostopts?match=1` | LAN Bo3 辅助：把建房 `cbMatchMode` 选到指定模式（0=Single、1=Match、2=Tag） | `{"ok":true,"queued":true,"matchMode":1}`；日志 `hostopts: matchMode=...` |
@@ -510,6 +516,8 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 | `YGO_PLACE_COORDS` | `server` | 放卡坐标约定：`server`（LocalPlayer 规则）/ `local`（raw half） |
 | `YGO_RESUME_JOURNAL` | `1` | 写/读 `resume-context-<port>.json`（重连 journal） |
 | `YGO_RESUME_PATH` | 自动 | 覆盖 journal 路径 |
+| `YGO_TP` | 未设 | 强制先/后攻：`1`=先攻、`2`=后攻（直接发 `CTOS_TP_RESULT`，日志 `TP choice res=..`；未设时控制驱动模式发布 `tpPending` prompt 等 `/act_id`） |
+| `YGO_SIDE_AUTO` | 未设 | `1`=收到 `STOC_CHANGE_SIDE` 时自动点 `SIDE OK`（日志 `SIDE auto-ok queued`），用于 LAN/脚本验证；排位不设，仍走 `sidePending`+`/act_id kind=side_ok` |
 | `YGO_NET_PROBE` | `1` | `/tip` 探活开关 |
 | `YGO_NET_PROBE_REQUIRE_SYSTEM` | `1` | 只把 `type==8` 的系统消息算探活回包 |
 | `YGO_NET_IDLE_MS` | `2500` | 多久无 STOC 触发探活 |
