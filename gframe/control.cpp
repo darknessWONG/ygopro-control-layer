@@ -86,7 +86,15 @@ constexpr int kPromptMsgs[] = {
 	MSG_SELECT_OPTION, MSG_SELECT_CARD, MSG_SELECT_CHAIN, MSG_SELECT_PLACE,
 	MSG_SELECT_POSITION, MSG_SELECT_TRIBUTE, MSG_SELECT_COUNTER, MSG_SELECT_SUM,
 	MSG_SELECT_DISFIELD, MSG_SORT_CARD, MSG_SELECT_UNSELECT_CARD,
+	MSG_ANNOUNCE_RACE, MSG_ANNOUNCE_ATTRIB, MSG_ANNOUNCE_CARD, MSG_ANNOUNCE_NUMBER,
 };
+// task-50: MSG_ANNOUNCE_NUMBER values (guarded by g_announceMutex; written on network thread)
+static std::mutex g_announceMutex;
+static std::vector<int> g_announceValues;
+void CopyAnnounceValues(std::vector<int>& out) {
+	std::lock_guard<std::mutex> lk(g_announceMutex);
+	out = g_announceValues;
+}
 bool IsPromptMsg(int id) {
 	for (int m : kPromptMsgs) if (m == id) return true;
 	return false;
@@ -2243,6 +2251,22 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 	// count==0 auto-sends -1) and must NOT be published as a prompt to the policy.
 	g_ctosAtMsgBegin.store(g_ctosCount.load());
 	g_ctosRespAtMsgBegin.store(g_ctosResponseCount.load());
+	// task-50: MSG_ANNOUNCE_NUMBER(143) layout: type u8, player u8, count u8, then count * int32 values
+	if (msgId == MSG_ANNOUNCE_NUMBER && len >= 3) {
+		const int cnt = (int)msg[2];
+		std::vector<int> vals;
+		for (int i = 0; i < cnt && (size_t)(3 + i * 4 + 4) <= len; ++i) {
+			const unsigned char* p = msg + 3 + i * 4;
+			int32_t v = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+				((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+			vals.push_back(v);
+		}
+		{
+			std::lock_guard<std::mutex> lk(g_announceMutex);
+			g_announceValues = vals;
+		}
+		Control::Log("ANNOUNCE number values=%zu first=%d", vals.size(), vals.empty() ? -1 : vals[0]);
+	}
 	// task-28j: raw SELECT_CHAIN header, to compare with what the client's handler sees
 	// (layout: type u8, selecting_player u8, count u8, specount u8, hint0 i32, hint1 i32, ...)
 	if (msgId == MSG_SELECT_CHAIN && len >= 4) {

@@ -256,6 +256,13 @@ std::string PromptJson(const Snapshot& s) {
 	   << ",\"lastChain\":" << (s.lastChain ? "true" : "false")
 	   << ",\"selectMin\":" << s.selectMin
 	   << ",\"selectMax\":" << s.selectMax
+	   // task-50: only present for MSG_ANNOUNCE_NUMBER (LLM picks one value)
+	   << ",\"announceNumberValues\":[";
+	for (size_t i = 0; i < s.announceNumberValues.size(); ++i) {
+		if (i) os << ',';
+		os << s.announceNumberValues[i];
+	}
+	os << ']'
 	   << ",\"selectCancelable\":" << (s.selectCancelable ? "true" : "false")
 	   << ",\"selectableCount\":" << s.selectableCount
 	   << ",\"canBp\":" << (s.canBp ? "true" : "false")
@@ -654,6 +661,9 @@ void SnapshotFromClient(Snapshot& s) {
 	s.selectMax = f.select_max;
 	s.selectCancelable = f.select_cancelable;
 	s.selectableCount = (int)f.selectable_cards.size();
+	// task-50: MSG_ANNOUNCE_NUMBER(143) offers explicit int32 values
+	s.announceNumberValues.clear();
+	if (s.curMsg == MSG_ANNOUNCE_NUMBER) CopyAnnounceValues(s.announceNumberValues);
 	s.sumTarget = f.select_sumval;
 	s.sumMode = f.select_mode;
 	auto addCard = [](std::vector<CandSnap>& out, ClientCard* pc) {

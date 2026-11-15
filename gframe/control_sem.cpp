@@ -156,11 +156,27 @@ std::vector<SemAction> BuildSemActions(const Snapshot& s) {
 		AddSem(v, "sort", "keep current order", 0, 0, 0, 0, 1);
 		break;
 	case MSG_ANNOUNCE_RACE:
-	case MSG_ANNOUNCE_ATTRIB:
-	case MSG_ANNOUNCE_NUMBER:
-	case MSG_ANNOUNCE_CARD:
-		AddSem(v, "announce", "auto announce (first option)", 0, 0, 0, 0, 1);
+		AddSem(v, "announce_race", "first race option (mask 1)", 1, 0, 0, 0, 1);
 		break;
+	case MSG_ANNOUNCE_ATTRIB:
+		AddSem(v, "announce_attrib", "first attribute option (mask 1)", 1, 0, 0, 0, 1);
+		break;
+	case MSG_ANNOUNCE_CARD:
+		AddSem(v, "announce_card", "first declarable card", 0, 0, 0, 0, 1);
+		break;
+	case MSG_ANNOUNCE_NUMBER: {
+		// response = the chosen value itself, so expose each offered number as its own action
+		if (s.announceNumberValues.empty()) {
+			AddSem(v, "announce_number", "announce 0", 0, 0, 0, 0, 1);
+		} else {
+			for (size_t i = 0; i < s.announceNumberValues.size(); ++i) {
+				char b[48];
+				snprintf(b, sizeof b, "announce %d", s.announceNumberValues[i]);
+				AddSem(v, "announce_number", b, s.announceNumberValues[i], 0, 0, 0, 1);
+			}
+		}
+		break;
+	}
 	default:
 		AddSem(v, "auto", "auto / safe default", 0, 0, 0, 0, 1);
 		break;
@@ -255,6 +271,24 @@ bool EncodeSemAction(const Snapshot& s, const SemAction& a, int32_t& outI, std::
 		for (int i = 0; i < n; ++i) outB.push_back((unsigned char)i);
 		return true;
 	}
+	case MSG_ANNOUNCE_NUMBER: {
+		// task-50: official response = SetResponseI(chosen value) (the value, not an index)
+		if (a.kind != "announce_number") { err = "unknown announce_number action"; return false; }
+		outI = a.index;
+		return true;
+	}
+	case MSG_ANNOUNCE_RACE:
+		if (a.kind != "announce_race") { err = "unknown announce_race action"; return false; }
+		outI = a.index > 0 ? a.index : 1; // bitmask
+		return true;
+	case MSG_ANNOUNCE_ATTRIB:
+		if (a.kind != "announce_attrib") { err = "unknown announce_attrib action"; return false; }
+		outI = a.index > 0 ? a.index : 1;
+		return true;
+	case MSG_ANNOUNCE_CARD:
+		if (a.kind != "announce_card") { err = "unknown announce_card action"; return false; }
+		outI = a.index; // card code
+		return true;
 	case MSG_SELECT_SUM: {
 		std::vector<std::pair<int, size_t>> items;
 		for (size_t i = 0; i < s.selectableList.size(); ++i)

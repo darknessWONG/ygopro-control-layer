@@ -216,6 +216,8 @@ struct Snapshot {
 	// (e.g. curMsg=MSG_WAITING while wQuery/wCardSelect is still waiting for our answer)
 	int pendingKind{ -1 };       // effective prompt id (12/13/14/15/16/19...) or -1
 	int realCurMsg{ -1 };        // dInfo.curMsg when the pending query was detected
+	// task-50: values offered by MSG_ANNOUNCE_NUMBER(143); response is the value itself
+	std::vector<int> announceNumberValues;
 };
 
 // control_sem.cpp: one semantic action offered to the LLM for the current prompt.
@@ -498,6 +500,8 @@ void LogVisibleWindows();
 int PendingUiKind();
 extern std::atomic<int> g_pendingUiKind;
 extern std::atomic<uint64_t> g_lastActQueuedTick; // task-41: debounce pending-query re-publish
+// task-50: copy the values offered by the latest MSG_ANNOUNCE_NUMBER
+void CopyAnnounceValues(std::vector<int>& out);
 // task-29a: click an existing widget through the normal GUI event path (same as a human click).
 // void* so this header stays independent of the irrlicht includes; the caller passes an IGUIElement*.
 bool ClickGuiButton(void* widget);

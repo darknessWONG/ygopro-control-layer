@@ -136,6 +136,7 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
 | `seq` `curMsg` `turn` `awaiting` | 当前 prompt 的序号/消息类型/回合/是否待答 |
 | `pendingKind` `realCurMsg` | **仅当 prompt 由"仍在等待的 UI 查询"合成时出现**：`realCurMsg` 是被后续消息覆盖的真实 `dInfo.curMsg`（通常 3=WAITING），`pendingKind` 是实际等待的查询类型（13=YESNO/EFFECTYN、15=SELECT_CARD、14=OPTION、19=POSITION）；正常 prompt 无这两个字段 |
 | `tpPending` `tpOptions` `tpChooseBy` | **仅先/后攻选择时出现**（见 §3.5）；`tpOptions:[1,2]`，1=先攻、2=后攻 |
+| `announceNumberValues` | **仅 `MSG_ANNOUNCE_NUMBER(143)` 时出现**：可用数值列表（int32）；`/actions` 为每个值给一条 `kind:"announce_number"`，选中后响应 = **数值本身**（不是下标）。`MSG_ANNOUNCE_RACE/ATTRIB` 用 `kind:"announce_race"/"announce_attrib"`（int32 位掩码），`MSG_ANNOUNCE_CARD` 用 `kind:"announce_card"`（int32 卡号） |
 | `summonable` `spsummonable` `msetable` `ssetable` `reposable` `activatable` `attackable` | 各类可动作数量 |
 | `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,op,lv,rk,ty,desc,ctrl,forced}` |
 | `chains` / `chainDepth` / `chainStack` / `chainingTo` / `chainCandidates` / `canDecline` / `hint` / `lastChainEvent` | 连锁相关（`chainCandidates` 为空表示"只能不连锁"） |

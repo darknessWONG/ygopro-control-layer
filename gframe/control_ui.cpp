@@ -456,6 +456,12 @@ static bool TryUiSemantic(const Action& a) {
 		Control::Log("UI skip select -> direct bytes (msg=%d)", msg);
 		return false;
 	}
+	// task-49: MSG_SORT_CARD has no meaningful UI injection either (official path is raw position
+	// bytes); skipping the UI attempt avoids the "UI fallback ... direct response" second send.
+	if (a.semKind == "sort" && msg == MSG_SORT_CARD) {
+		Control::Log("UI skip sort -> direct bytes (msg=%d)", msg);
+		return false;
+	}
 	if (a.semKind == "yes" && (msg == MSG_SELECT_YESNO || msg == MSG_SELECT_EFFECTYN)) {
 		ClickButton(mainGame->btnYes);
 		return ok("button btnYes", BUTTON_YES);
