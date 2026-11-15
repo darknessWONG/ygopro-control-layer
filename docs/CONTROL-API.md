@@ -335,12 +335,13 @@ curl.exe -s -X POST "http://127.0.0.1:7788/start"
 
 `/net/probe` 主动探一次（默认自动探活已开启）：`{"ok":<有回包>,"sent":..,"rttMs":..,"alive":..,"fails":..,"lastReplyPlayerType":..}`。
 
-> **被动判死与"对手长考"**：`probe.enabled=false`（例如排位里关掉主动 `/tip`）时，客户端靠
-> `sinceLastStoc` 判死。默认阈值 `YGO_NET_DEAD_SILENCE_MS=10000`，但**当不是我的回合且没有
-> awaiting/queued action 时**有效阈值自动放宽到 **60s**（对手长考/AFK 不再 10s 误报）；静默 >30s 时
-> 每 15s 打日志 `NET silence diag since=.. oppTurn=.. awaiting=.. lastStoc=.. timeLeft=.. effSilence=..`，
-> 判死日志 `NET DEAD reason=stoc-timeout since=.. eff=.. oppTurn=..`。真断线（我方回合或 >60s）仍会判
-> `confirmed_dead`，供 supervisor 重启/重进。
+> **被动判死与"自己回合思考"**：`probe.enabled=false`（例如排位里关掉主动 `/tip`）时，客户端靠
+> `sinceLastStoc` 判死。默认阈值 `YGO_NET_DEAD_SILENCE_MS=60000`；**轮到我方回合、或我方 `timeLeft`
+> 仍在倒计时时永不判死**（服务端本来就不会发包，此时静默是正常的），只打
+> `NET ALIVE reason=our-turn-idle since=.. timeLeft=.. awaiting=..`。等待对手且无待答动作时静默超过阈值
+> 才判 `confirmed_dead`，日志 `NET DEAD reason=idle-no-packet since=.. eff=.. oppTurn=..`。
+> 旧版（≤2026-11-15 19:05:42）默认只有 10s 且没有"我方回合"豁免，会把思考中的自己误判掉线 → 必须
+> 启动时显式设 `YGO_NET_DEAD_SILENCE_MS=600000`；当前版不再需要（显式设仍安全）。
 
 ```bat
 curl.exe -s http://127.0.0.1:7788/net
