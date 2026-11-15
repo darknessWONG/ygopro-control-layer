@@ -541,7 +541,7 @@ std::atomic<uint64_t> g_netProbeTrafficTick{ 0 }; // last non-chat STOC (generic
 std::atomic<int> g_netProbeIdleMs{ 2500 };     // probe when no STOC for this long
 std::atomic<int> g_netProbeGapMs{ 3000 };      // min interval between probes
 std::atomic<int> g_netProbeWindowMs{ 1500 };   // reply window after sending /tip
-std::atomic<int> g_netProbeSilenceMs{ 10000 }; // passive "confirmed dead" silence threshold
+std::atomic<int> g_netProbeSilenceMs{ 60000 }; // task-48: passive dead threshold (was 10s, caused false kills)
 std::atomic<uint64_t> g_lastNetMsgTick{ 0 };
 std::atomic<int> g_lastNetMsgId{ -1 };
 bool g_suppressModals{ true };
@@ -552,6 +552,7 @@ std::string g_netCloseReason{ "none" };
 std::atomic<bool> g_controlDriven{ false };
 std::atomic<bool> g_tpPending{ false };
 std::atomic<bool> g_tpPromptActive{ false };
+std::atomic<long long> g_tpDeadlineMs{ 0 }; // task-48: auto-answer TP if no external choice in 2s
 // task-35: Bo3 side decking (see control_internal.h)
 std::atomic<bool> g_sidePending{ false };
 std::atomic<bool> g_sidePromptActive{ false };
@@ -1093,23 +1094,35 @@ static void NetPumpProber(uint64_t now) {
 		actionsPending = !g_actions.empty();
 	}
 	const bool oppTurn = (g_turnPlayerLocal >= 0 && g_turnPlayerLocal != 0);
+	const bool ourTurn = (g_turnPlayerLocal == 0);
+	const bool clockRunning = (g_timeLeft > 0);
 	const bool quiet = !awaitingNow && !actionsPending && !g_uiPending.active;
 	long long effSilence = silenceMs;
 	if (oppTurn && quiet && effSilence < 60000) effSilence = 60000;
+	// task-48: NEVER passive-kill on our own turn / while our clock is running: the server simply
+	// has nothing to send while we think. (This false positive got users kicked at 10s.)
+	if (ourTurn || clockRunning) {
+		static uint64_t lastAliveDiag = 0;
+		if (now - lastAliveDiag >= 15000 && since > 10000) {
+			lastAliveDiag = now;
+			Control::Log("NET ALIVE reason=our-turn-idle since=%lldms timeLeft=%d awaiting=%d",
+				since, g_timeLeft, awaitingNow ? 1 : 0);
+		}
+	}
 	// periodic diagnostic when the server stays silent (helps distinguish server bug vs AFK)
 	if (since > 30000) {
 		static uint64_t lastSilenceDiag = 0;
 		if (now - lastSilenceDiag >= 15000) {
 			lastSilenceDiag = now;
-			Control::Log("NET silence diag since=%lldms oppTurn=%d awaiting=%d lastStoc=%s timeLeft=%d effSilence=%lldms",
-				since, oppTurn ? 1 : 0, awaitingNow ? 1 : 0, StocName(g_lastStocId.load()),
+			Control::Log("NET silence diag since=%lldms oppTurn=%d ourTurn=%d awaiting=%d lastStoc=%s timeLeft=%d effSilence=%lldms",
+				since, oppTurn ? 1 : 0, ourTurn ? 1 : 0, awaitingNow ? 1 : 0, StocName(g_lastStocId.load()),
 				g_timeLeft, effSilence);
 		}
 	}
-	if (since > effSilence && now - g_netAliveSince.load() > 2500) {
+	if (!ourTurn && !clockRunning && since > effSilence && now - g_netAliveSince.load() > 2500) {
 		if (quiet && g_netAlive.exchange(false)) {
 			g_netState.store(NET_STATE_CONFIRMED_DEAD);
-			Control::Log("NET DEAD reason=stoc-timeout since=%lldms eff=%lldms oppTurn=%d",
+			Control::Log("NET DEAD reason=idle-no-packet since=%lldms eff=%lldms oppTurn=%d",
 				since, effSilence, oppTurn ? 1 : 0);
 		}
 	}
@@ -1487,6 +1500,7 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 					g_actions.push_back(std::move(a));
 					g_tpPromptActive.store(false);
 					g_tpPending.store(false);
+					g_tpDeadlineMs.store(0);
 					g_awaiting = false;
 					g_lastActQueuedTick.store(GetTickCount64());
 				}
@@ -1501,18 +1515,40 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			{
 				std::lock_guard<std::mutex> lk(g_mutex);
 				if (!g_awaiting) { body = "{\"ok\":false,\"error\":\"not awaiting\"}"; return body; }
+				// task-48: reject stale action ids (caller reuses an id from an older /actions seq)
+				const std::string seqParam = QueryParam(query, "seq");
+				if (!seqParam.empty() && (unsigned long long)atoll(seqParam.c_str()) != g_seq) {
+					Control::Log("act_id stale seq param=%s current=%llu", seqParam.c_str(), (unsigned long long)g_seq);
+					body = "{\"ok\":false,\"error\":\"stale action id, refresh /actions\"}";
+					return body;
+				}
 				// task-41: use the frozen prompt snapshot (it may carry a pendingKind override when
 				// dInfo.curMsg was overwritten by a later message).
 				const Snapshot& cur = g_promptSnapValid.load() ? g_promptSnap : g_shared;
+				const int dcur = mainGame ? (int)mainGame->dInfo.curMsg : -1;
+				if (IsPromptMsg(dcur) && dcur != cur.curMsg) {
+					Control::Log("act_id stale snapshot snapCurMsg=%d dInfoCurMsg=%d seq=%llu",
+						cur.curMsg, dcur, (unsigned long long)g_seq);
+					body = "{\"ok\":false,\"error\":\"stale action id, refresh /actions\"}";
+					return body;
+				}
 				auto acts = BuildSemActions(cur);
 				if (id < 0 || id >= (int)acts.size()) { body = "{\"ok\":false,\"error\":\"bad action id\"}"; return body; }
 				ok = EncodeSemAction(cur, acts[id], ival, bytes, err);
 				if (ok) {
-					// task-42: make the effective (real vs synthetic) message ids visible for triage
-					Control::Log("SEND RESPONSE realMsg=%d(%s) synthMsg=%d(%s) len=%d i=%d",
+					std::string hex;
+					for (size_t bi = 0; bi < bytes.size() && bi < 16; ++bi) {
+						char hb[4];
+						snprintf(hb, sizeof hb, "%02x", (unsigned)bytes[bi]);
+						hex += hb;
+					}
+					// task-42/48: real vs synthetic message ids + snapshot/current curMsg for triage
+					Control::Log("SEND RESPONSE realMsg=%d(%s) synthMsg=%d(%s) snapCurMsg=%d dInfoCurMsg=%d "
+						"selectMin=%d selectMax=%d len=%d i=%d hex=%s",
 						(cur.pendingKind > 0 ? cur.realCurMsg : cur.curMsg),
 						MsgName(cur.pendingKind > 0 ? cur.realCurMsg : cur.curMsg),
-						cur.curMsg, MsgName(cur.curMsg), (int)bytes.size(), ival);
+						cur.curMsg, MsgName(cur.curMsg), cur.curMsg, dcur,
+						cur.selectMin, cur.selectMax, (int)bytes.size(), ival, hex.c_str());
 					act.i = ival;
 					act.bytes = bytes;
 					if (g_uiActions) {
@@ -1994,6 +2030,7 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 		}
 		g_tpPending.store(false);
 		g_tpPromptActive.store(false);
+		g_tpDeadlineMs.store(0);
 		g_sidePending.store(false);
 		g_sidePromptActive.store(false);
 		// task-38: a new game must not show a resume journal from the previous one
@@ -2094,7 +2131,8 @@ bool Control::AutoTpResult() {
 	}
 	if (g_controlDriven.load()) {
 		g_tpPending.store(true);
-		Control::Log("TP pending: waiting for LLM choice (control-driven, no auto-send)");
+		g_tpDeadlineMs.store((long long)GetTickCount64() + 2000);
+		Control::Log("TP pending: external choice window 2000ms (auto-answer after deadline)");
 		return true; // swallow the native UI; Pump publishes the prompt
 	}
 	// manual play: unchanged legacy default (second)
@@ -2493,6 +2531,30 @@ void Control::Pump() {
 	// task-34: STOC_SELECT_TP arrived while control-driven -> publish a synthetic "tp" prompt.
 	// It is not a MSG prompt, so it has its own publish path; g_awaiting/g_promptSnap make it
 	// behave exactly like a normal prompt (/prompt is frozen, /actions gives the two choices).
+	// task-48: never let the server time us out on TP (13s eof). Auto-answer after 2s unless
+	// YGO_TP_AUTO=0. res default 2 (legacy default), override with YGO_TP_AUTO_RES=1|2.
+	if (g_tpPending.load()) {
+		const long long dl = g_tpDeadlineMs.load();
+		const char* autoOff = std::getenv("YGO_TP_AUTO");
+		const bool autoOn = !(autoOff && std::atoi(autoOff) == 0);
+		if (autoOn && dl > 0 && (long long)GetTickCount64() >= dl) {
+			const char* rEnv = std::getenv("YGO_TP_AUTO_RES");
+			int res = (rEnv && std::atoi(rEnv) >= 1 && std::atoi(rEnv) <= 3) ? std::atoi(rEnv) : 2;
+			CTOS_TPResult pkt;
+			pkt.res = (unsigned char)res;
+			DuelClient::SendPacketToServer(CTOS_TP_RESULT, pkt);
+			g_tpPending.store(false);
+			g_tpPromptActive.store(false);
+			g_tpDeadlineMs.store(0);
+			{
+				std::lock_guard<std::mutex> lk(g_mutex);
+				g_awaiting = false;
+				g_promptSnapValid.store(false);
+			}
+			Control::Log("TP auto-answered res=%d (no external choice in 2000ms)", res);
+			g_cv.notify_all();
+		}
+	}
 	if (g_tpPending.load() && !g_tpPromptActive.load()) {
 		std::lock_guard<std::mutex> lk(g_mutex);
 		if (!g_awaiting) {

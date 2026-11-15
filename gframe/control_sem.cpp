@@ -236,12 +236,23 @@ bool EncodeSemAction(const Snapshot& s, const SemAction& a, int32_t& outI, std::
 	case MSG_SELECT_CARD:
 	case MSG_SELECT_TRIBUTE:
 	case MSG_SELECT_UNSELECT_CARD: {
-		int n = s.selectMin > 0 ? s.selectMin : 1;
-		if ((int)s.selectableList.size() < n) n = (int)s.selectableList.size();
-		if (n <= 0) { err = "no selectable cards"; return false; }
+		// task-48: official response is [count][selected_cards[i]->select_seq ...].  select_min may
+		// legitimately be 0 (e.g. optional attack-target windows): then the valid answer is [0],
+		// NOT a forced 1-card selection (the old clamp to 1 produced illegal responses).
+		int n = s.selectMin > 0 ? s.selectMin : 0;
+		if ((int)s.selectableList.size() < n) { err = "not enough selectable cards"; return false; }
 		outB.clear();
 		outB.push_back((unsigned char)n);
 		for (int i = 0; i < n; ++i) outB.push_back((unsigned char)s.selectableList[i].seqNo);
+		return true;
+	}
+	case MSG_SORT_CARD: {
+		// task-48: official keep-order response is RAW position bytes (no count prefix), length =
+		// select_max.  A count prefix makes the core read a bad order -> endless re-ask.
+		int n = s.selectMax > 0 ? s.selectMax : (int)s.selectableList.size();
+		if (n < 0) n = 0;
+		outB.clear();
+		for (int i = 0; i < n; ++i) outB.push_back((unsigned char)i);
 		return true;
 	}
 	case MSG_SELECT_SUM: {

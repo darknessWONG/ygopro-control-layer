@@ -167,8 +167,11 @@ curl.exe -s "http://127.0.0.1:7788/wait_prompt?since=12&timeout_ms=30000"
 - `awaiting:false` 时返回 `{"actions":[],"awaiting":false,...,"reason":"not awaiting"}`；
 - `curMsg/seq` 与 `/prompt` 一致（prompt 快照）。
 
-`/act_id?id=<id>`：提交上表中的一个动作；成功 `{"ok":true,"queued":true}`。
+`/act_id?id=<id>[&seq=<seq>]`：提交上表中的一个动作；成功 `{"ok":true,"queued":true}`。
 `id` 无效 → `{"ok":false,"error":"bad action id"}`；无 prompt → `not awaiting`。
+**建议带 `/actions` 返回的 `seq`**：与当前 prompt 不一致会返回 `{"ok":false,"error":"stale action id, refresh /actions"}`（防止拿旧动作回答新 prompt；战斗/选卡流程尤其重要）。
+
+> 选卡类动作（`MSG_SELECT_CARD/TRIBUTE/UNSELECT_CARD`）由控制层**直接发裸字节** `[count][select_seq...]`（与官方 `SetResponseSelectedCards()` 一致，不走 UI 点击）；`MSG_SORT_CARD` 发**裸位序字节** `[0,1,...selectMax-1]`（无 count 前缀，保持原序即 `hex=0001`）。
 
 ```bat
 curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=2"
@@ -523,7 +526,9 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 | `YGO_NET_IDLE_MS` | `2500` | 多久无 STOC 触发探活 |
 | `YGO_NET_PROBE_GAP_MS` | `3000` | 两次探活最小间隔 |
 | `YGO_NET_PROBE_WINDOW_MS` | `1500` | 探活回包等待窗口 |
-| `YGO_NET_DEAD_SILENCE_MS` | `10000` | 静默判死阈值（被动探测） |
+| `YGO_NET_DEAD_SILENCE_MS` | `60000` | 被动静默判死阈值；**我方回合或我方倒计时在走时永不判死**（日志 `NET ALIVE reason=our-turn-idle`），判死日志 `NET DEAD reason=idle-no-packet` |
+| `YGO_TP_AUTO` | `1` | 先/后攻询问若 2s 内没有外部 `/act_id kind=tp`，自动作答（防服务端 13s eof）；`0` 关闭 |
+| `YGO_TP_AUTO_RES` | `2` | 自动答的值：`1`=先攻、`2`=后攻 |
 | `YGO_CTRL_DEBUG` | 未设 | 设任意值输出逐帧调试日志（`CDBG`/`DBG`） |
 
 ---

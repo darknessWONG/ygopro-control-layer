@@ -448,6 +448,14 @@ static bool TryUiSemantic(const Action& a) {
 		return true;
 	};
 	// ---- button based prompts -------------------------------------------------
+	// task-48: card-selection responses are safer as raw bytes ([count][select_seq...]): the UI
+	// injection path depends on per-frame widget state and was suspected in battle-target retries.
+	// Fall back to the direct encoder (same bytes as the official SetResponseSelectedCards()).
+	if (a.semKind == "select" && (msg == MSG_SELECT_CARD || msg == MSG_SELECT_TRIBUTE ||
+		msg == MSG_SELECT_UNSELECT_CARD)) {
+		Control::Log("UI skip select -> direct bytes (msg=%d)", msg);
+		return false;
+	}
 	if (a.semKind == "yes" && (msg == MSG_SELECT_YESNO || msg == MSG_SELECT_EFFECTYN)) {
 		ClickButton(mainGame->btnYes);
 		return ok("button btnYes", BUTTON_YES);
