@@ -2449,11 +2449,132 @@ void Control::OnAnalyzeEnd() {
 	g_snapshotWanted = true;
 }
 
+// task-51: LLM-silent prompt guard. A published prompt that nobody answers gets us kicked by the
+// server's AFK timer (EOF). After YGO_PROMPT_AUTO_DEFAULT_MS (default 60s, 0=off) send a conservative
+// default for the current prompt; warn at 45s so the orchestrator can react.
+namespace ctl {
+std::atomic<long long> g_promptSinceMs{ 0 };
+static std::atomic<uint64_t> g_promptRespBase{ 0 };
+static bool g_promptIdleWarned = false;
+long long PromptIdleMs() {
+	if (!g_awaiting || g_promptSinceMs.load() <= 0) return -1;
+	return (long long)GetTickCount64() - g_promptSinceMs.load();
+}
+static void PromptIdlePump(uint64_t now) {
+	if (!g_controlDriven.load()) { g_promptSinceMs.store(0); return; }
+	const char* env = std::getenv("YGO_PROMPT_AUTO_DEFAULT_MS");
+	const int autoMs = env ? std::atoi(env) : 60000;
+	if (!g_awaiting || g_tpPromptActive.load() || g_sidePromptActive.load() || g_sidePending.load()) {
+		g_promptSinceMs.store(0);
+		g_promptIdleWarned = false;
+		return;
+	}
+	long long since = g_promptSinceMs.load();
+	if (since <= 0) {
+		g_promptSinceMs.store((long long)now);
+		g_promptRespBase.store(g_ctosResponseCount.load());
+		g_promptIdleWarned = false;
+		return;
+	}
+	const long long idle = (long long)now - since;
+	const char* warnEnv = std::getenv("YGO_PROMPT_IDLE_WARN_MS");
+	const long long warnMs = warnEnv ? (long long)std::atoll(warnEnv) : 45000;
+	if (warnMs > 0 && idle >= warnMs && !g_promptIdleWarned) {
+		g_promptIdleWarned = true;
+		Control::Log("PROMPT idle warning seq=%llu msg=%d idle=%lldms",
+			(unsigned long long)g_seq, (int)mainGame->dInfo.curMsg, idle);
+	}
+	if (autoMs <= 0 || idle < (long long)autoMs) return;
+	if (g_ctosResponseCount.load() != g_promptRespBase.load()) {
+		// something did respond; bookkeeping will clear awaiting shortly - do not double-answer
+		return;
+	}
+	Snapshot snap;
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		if (!g_awaiting) return;
+		snap = g_promptSnapValid.load() ? g_promptSnap : g_shared;
+	}
+	auto acts = BuildSemActions(snap);
+	if (acts.empty()) {
+		Control::Log("PROMPT auto-default no action available (msg=%d)", snap.curMsg);
+		g_promptSinceMs.store((long long)now);
+		return;
+	}
+	auto pickKind = [&acts](const char* kind, int wantIndex) -> int {
+		for (size_t i = 0; i < acts.size(); ++i) {
+			if (acts[i].kind == kind && (wantIndex < 0 || acts[i].index == wantIndex)) return (int)i;
+		}
+		return -1;
+	};
+	int ai = -1;
+	switch (snap.curMsg) {
+	case MSG_SELECT_EFFECTYN:
+	case MSG_SELECT_YESNO: ai = pickKind("no", -1); break;
+	case MSG_SELECT_CHAIN:
+		ai = snap.chainForced ? pickKind("chain", -1) : pickKind("decline", -1);
+		break;
+	case MSG_SELECT_OPTION: ai = pickKind("option", -1); break;
+	case MSG_SELECT_IDLECMD: ai = pickKind("to_ep", -1); break;
+	case MSG_SELECT_BATTLECMD: ai = pickKind("end_battle", -1); break;
+	case MSG_SELECT_CARD:
+	case MSG_SELECT_TRIBUTE:
+	case MSG_SELECT_UNSELECT_CARD: ai = pickKind("select", -1); break;
+	case MSG_SELECT_PLACE:
+	case MSG_SELECT_DISFIELD: ai = pickKind("place", -1); break;
+	case MSG_SELECT_POSITION: ai = pickKind("position", 0x01); break;
+	case MSG_SORT_CARD: ai = pickKind("sort", -1); break;
+	case MSG_ANNOUNCE_RACE: ai = pickKind("announce_race", -1); break;
+	case MSG_ANNOUNCE_ATTRIB: ai = pickKind("announce_attrib", -1); break;
+	case MSG_ANNOUNCE_CARD: ai = pickKind("announce_card", -1); break;
+	case MSG_ANNOUNCE_NUMBER: ai = pickKind("announce_number", -1); break;
+	default: break;
+	}
+	if (ai < 0) ai = 0;
+	int32_t ival = 0;
+	std::vector<unsigned char> bytes;
+	std::string err;
+	if (!EncodeSemAction(snap, acts[ai], ival, bytes, err)) {
+		Control::Log("PROMPT auto-default encode failed msg=%d err=%s", snap.curMsg, err.c_str());
+		g_promptSinceMs.store((long long)now);
+		return;
+	}
+	Action act;
+	act.i = ival;
+	act.bytes = bytes;
+	if (g_uiActions) {
+		act.kind = ActionKind::UiSem;
+		act.semKind = acts[ai].kind;
+		act.semIndex = acts[ai].index;
+		act.semCtrl = acts[ai].ctrl;
+		act.semLoc = acts[ai].loc;
+		act.semSeq = acts[ai].seq;
+	} else {
+		act.kind = bytes.empty() ? ActionKind::Int32 : ActionKind::Bytes;
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		g_actions.push_back(std::move(act));
+		g_awaiting = false;
+		g_promptSnapValid.store(false);
+		g_pendingUiKind.store(0);
+		g_lastActQueuedTick.store(GetTickCount64());
+	}
+	g_promptSinceMs.store(0);
+	g_promptIdleWarned = false;
+	Control::Log("PROMPT auto-default msg=%d seq=%llu kind=%s after=%lldms (idle guard, LLM silent)",
+		snap.curMsg, (unsigned long long)g_seq, acts[ai].kind.c_str(), idle);
+	g_cv.notify_all();
+}
+
+} // namespace ctl
+
 void Control::Pump() {
 	CtlDbg("Pump enter");
 	const uint64_t now = GetTickCount64();
 	++g_pumpCount;
 	g_lastPumpTick.store(now);
+	PromptIdlePump(now); // task-51: never let an LLM-silent prompt hang until the server kicks us
 	// ------------------------------------------------------------------
 	// task-18: verify the previous UI action actually reached the kernel.
 	// A successful click must produce either a CTOS_RESPONSE or a newly analyzed message;

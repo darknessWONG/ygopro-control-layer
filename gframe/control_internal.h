@@ -502,6 +502,10 @@ extern std::atomic<int> g_pendingUiKind;
 extern std::atomic<uint64_t> g_lastActQueuedTick; // task-41: debounce pending-query re-publish
 // task-50: copy the values offered by the latest MSG_ANNOUNCE_NUMBER
 void CopyAnnounceValues(std::vector<int>& out);
+// task-51: idle guard for control-driven prompts (auto conservative default after N ms)
+extern std::atomic<long long> g_promptSinceMs;
+long long PromptIdleMs(); // -1 when not awaiting
+void PromptIdlePump(uint64_t now); // called from Control::Pump each frame
 // task-29a: click an existing widget through the normal GUI event path (same as a human click).
 // void* so this header stays independent of the irrlicht includes; the caller passes an IGUIElement*.
 bool ClickGuiButton(void* widget);

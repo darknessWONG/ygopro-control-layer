@@ -227,6 +227,11 @@ std::string PromptJson(const Snapshot& s) {
 	std::ostringstream os;
 	os << "{\"seq\":" << g_seq << ",\"curMsg\":" << s.curMsg << ",\"turn\":" << s.turn
 	   << ",\"awaiting\":" << (g_awaiting ? "true" : "false");
+	// task-51: how long this prompt has been waiting for an external answer (idle guard)
+	{
+		const long long idle = PromptIdleMs();
+		if (idle >= 0) os << ",\"awaitingSinceMs\":" << idle;
+	}
 	// task-41: report when the effective prompt came from a still-visible UI query
 	if (s.pendingKind > 0) {
 		os << ",\"pendingKind\":" << s.pendingKind << ",\"realCurMsg\":" << s.realCurMsg;

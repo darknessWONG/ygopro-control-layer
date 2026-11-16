@@ -134,6 +134,7 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
 | 字段 | 说明 |
 |---|---|
 | `seq` `curMsg` `turn` `awaiting` | 当前 prompt 的序号/消息类型/回合/是否待答 |
+| `awaitingSinceMs` | **等待已持续毫秒数**（仅 `awaiting=true` 时出现）；超过 45s 会打 `PROMPT idle warning`，默认 60s 自动兜底（见 `YGO_PROMPT_AUTO_DEFAULT_MS`） |
 | `pendingKind` `realCurMsg` | **仅当 prompt 由"仍在等待的 UI 查询"合成时出现**：`realCurMsg` 是被后续消息覆盖的真实 `dInfo.curMsg`（通常 3=WAITING），`pendingKind` 是实际等待的查询类型（13=YESNO/EFFECTYN、15=SELECT_CARD、14=OPTION、19=POSITION）；正常 prompt 无这两个字段 |
 | `tpPending` `tpOptions` `tpChooseBy` | **仅先/后攻选择时出现**（见 §3.5）；`tpOptions:[1,2]`，1=先攻、2=后攻 |
 | `announceNumberValues` | **仅 `MSG_ANNOUNCE_NUMBER(143)` 时出现**：可用数值列表（int32）；`/actions` 为每个值给一条 `kind:"announce_number"`，选中后响应 = **数值本身**（不是下标）。`MSG_ANNOUNCE_RACE/ATTRIB` 用 `kind:"announce_race"/"announce_attrib"`（int32 位掩码），`MSG_ANNOUNCE_CARD` 用 `kind:"announce_card"`（int32 卡号） |
@@ -531,6 +532,8 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 | `YGO_NET_DEAD_SILENCE_MS` | `60000` | 被动静默判死阈值；**我方回合或我方倒计时在走时永不判死**（日志 `NET ALIVE reason=our-turn-idle`），判死日志 `NET DEAD reason=idle-no-packet` |
 | `YGO_TP_AUTO` | `1` | 先/后攻询问若 2s 内没有外部 `/act_id kind=tp`，自动作答（防服务端 13s eof）；`0` 关闭 |
 | `YGO_TP_AUTO_RES` | `2` | 自动答的值：`1`=先攻、`2`=后攻 |
+| `YGO_PROMPT_AUTO_DEFAULT_MS` | `60000` | **prompt 空闲兜底**：控制驱动下若已发布 prompt 且超过该时间没有任何 `CTOS_RESPONSE`，自动发保守默认动作。**服务端 AFK 约 90s 会 eof 踢人**；本 guard 在 60s（默认）先答掉，避免意外 EOF。`0` 关闭。日志 `PROMPT auto-default msg=.. seq=.. kind=.. after=..ms (idle guard, LLM silent)` |
+| `YGO_PROMPT_IDLE_WARN_MS` | `45000` | 空闲告警阈值（仅日志 `PROMPT idle warning seq=.. msg=.. idle=..ms`），便于上层 agent 感知；可调小用于测试 |
 | `YGO_CTRL_DEBUG` | 未设 | 设任意值输出逐帧调试日志（`CDBG`/`DBG`） |
 
 ---
