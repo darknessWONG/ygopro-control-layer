@@ -525,6 +525,7 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 | `YGO_TP` | 未设 | 强制先/后攻：`1`=先攻、`2`=后攻（直接发 `CTOS_TP_RESULT`，日志 `TP choice res=..`；未设时控制驱动模式发布 `tpPending` prompt 等 `/act_id`） |
 | `YGO_SIDE_AUTO` | 未设 | `1`=收到 `STOC_CHANGE_SIDE` 时自动点 `SIDE OK`（日志 `SIDE auto-ok queued`），用于 LAN/脚本验证；排位不设，仍走 `sidePending`+`/act_id kind=side_ok` |
 | `YGO_NET_PROBE` | `1` | `/tip` 探活开关 |
+| `YGO_NET_PROBE_FAIL_MAX` | `5` | `/tip` 连续超时达到该次数只**降级状态**（`probe_failed`）并打 `NET probe failed ... (defer to passive silence guard)`，**绝不单独判死/断线**；真正的判死统一由被动静默阈值 + 我方回合/busy 守卫决定 |
 | `YGO_NET_PROBE_REQUIRE_SYSTEM` | `1` | 只把 `type==8` 的系统消息算探活回包 |
 | `YGO_NET_IDLE_MS` | `2500` | 多久无 STOC 触发探活 |
 | `YGO_NET_PROBE_GAP_MS` | `3000` | 两次探活最小间隔 |

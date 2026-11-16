@@ -1076,14 +1076,32 @@ static void NetPumpProber(uint64_t now) {
 				g_netAliveSince.store(now);
 				Control::Log("NET probe unsupported (traffic ok, no system /tip reply) -> passive mode");
 			} else {
+				// task-52: probe timeouts must NEVER kill the session by themselves. The real MC
+				// server often stays silent for several seconds during long opponent combos; two
+				// missed /tip replies used to force confirmed_dead + disconnect. Death is now decided
+				// only by the passive silence guard below (YGO_NET_DEAD_SILENCE_MS + our-turn/busy
+				// exemptions). Here we only degrade the probe state.
+				const char* fmEnv = std::getenv("YGO_NET_PROBE_FAIL_MAX");
+				const int failMax = fmEnv ? std::atoi(fmEnv) : 5;
 				const int fails = g_netProbeFails.fetch_add(1) + 1;
-				Control::Log("NET probe timeout fails=%d sinceStoc=%lldms", fails, since);
-				if (fails >= 2) {
-					g_netAlive.store(false);
-					g_netState.store(NET_STATE_CONFIRMED_DEAD);
-					Control::Log("NET DEAD reason=probe-fails fails=%d", fails);
+				const bool ourTurn = (g_turnPlayerLocal == 0);
+				bool awaitingNow = false;
+				bool actionsPending = false;
+				{
+					std::lock_guard<std::mutex> lk(g_mutex);
+					awaitingNow = g_awaiting;
+					actionsPending = !g_actions.empty();
+				}
+				const char* why = ourTurn ? "our-turn" : (awaitingNow ? "awaiting" : (actionsPending ? "busy" : "silence"));
+				Control::Log("NET probe timeout fails=%d sinceStoc=%lldms ourTurn=%d awaiting=%d",
+					fails, since, ourTurn ? 1 : 0, awaitingNow ? 1 : 0);
+				g_netState.store(NET_STATE_PROBE_FAILED);
+				if (failMax > 0 && fails >= failMax) {
+					Control::Log("NET probe failed fails=%d (defer to passive silence guard) sinceStoc=%lldms",
+						fails, since);
+					g_netProbeFails.store(0); // keep counting in a fresh window, still never kills
 				} else {
-					g_netState.store(NET_STATE_PROBE_FAILED);
+					Control::Log("NET probe deferred (reason=%s sinceStoc=%lldms)", why, since);
 				}
 			}
 		}
