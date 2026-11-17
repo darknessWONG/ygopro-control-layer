@@ -120,9 +120,23 @@ std::vector<SemAction> BuildSemActions(const Snapshot& s) {
 	case MSG_SELECT_CARD:
 	case MSG_SELECT_TRIBUTE:
 	case MSG_SELECT_UNSELECT_CARD: {
-		const int n = s.selectMin > 0 ? s.selectMin : 1;
-		snprintf(buf, sizeof buf, "select first %d card(s)", n);
-		AddSem(v, "select", buf, 0, 0, 0, 0, n);
+		// task-53: expose every candidate so the caller can CHOOSE (the old single "select" action
+		// always picked index 0 -> battle target selection always hit the first monster).
+		const bool attackTarget = (s.curMsg == MSG_SELECT_CARD && s.selectMax == 1 && (s.phase & PHASE_BATTLE));
+		if (s.selectMin <= 1 && !s.selectableList.empty()) {
+			for (size_t i = 0; i < s.selectableList.size(); ++i) {
+				const CandSnap& c = s.selectableList[i];
+				snprintf(buf, sizeof buf, "%scard #%d code=%u atk=%d def=%d loc=%d seq=%d",
+					attackTarget ? "attack target: " : "", (int)i, c.code, c.atk, c.def, c.loc, c.seq);
+				AddSem(v, "select_card", buf, (int)i, 0, 0, 0, 1);
+			}
+			snprintf(buf, sizeof buf, "auto: pick first %d card(s)", 1);
+			AddSem(v, "select_auto", buf, 0, 0, 0, 0, 1);
+		} else {
+			const int n = s.selectMin > 0 ? s.selectMin : 1;
+			snprintf(buf, sizeof buf, "auto: pick first %d card(s)", n);
+			AddSem(v, "select_auto", buf, 0, 0, 0, 0, n);
+		}
 		break;
 	}
 	case MSG_SELECT_POSITION:
@@ -252,9 +266,25 @@ bool EncodeSemAction(const Snapshot& s, const SemAction& a, int32_t& outI, std::
 	case MSG_SELECT_CARD:
 	case MSG_SELECT_TRIBUTE:
 	case MSG_SELECT_UNSELECT_CARD: {
-		// task-48: official response is [count][selected_cards[i]->select_seq ...].  select_min may
-		// legitimately be 0 (e.g. optional attack-target windows): then the valid answer is [0],
-		// NOT a forced 1-card selection (the old clamp to 1 produced illegal responses).
+		// task-53: "select_card" picks an explicit candidate; "select_auto"/legacy "select" keep
+		// the old auto behaviour (first select_min cards / [0] when select_min==0).
+		const bool explicitPick = (a.kind == "select_card");
+		if (explicitPick) {
+			if (s.selectMin > 1) { err = "select_card only supports single-card selections; use select_auto"; return false; }
+			if (a.index < 0 || a.index >= (int)s.selectableList.size()) { err = "bad select_card index"; return false; }
+			const unsigned seq = s.selectableList[a.index].seqNo;
+			Control::Log("SELECT picked=%d code=%u loc=%d seq=%d seqNo=%u",
+				a.index, s.selectableList[a.index].code, s.selectableList[a.index].loc,
+				s.selectableList[a.index].seq, seq);
+			outB.clear();
+			outB.push_back(1);
+			outB.push_back((unsigned char)seq);
+			return true;
+		}
+		if (a.kind != "select_auto" && a.kind != "select" && a.kind != "auto") {
+			err = "unknown select action";
+			return false;
+		}
 		int n = s.selectMin > 0 ? s.selectMin : 0;
 		if ((int)s.selectableList.size() < n) { err = "not enough selectable cards"; return false; }
 		outB.clear();

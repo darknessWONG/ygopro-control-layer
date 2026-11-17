@@ -167,6 +167,11 @@ curl.exe -s "http://127.0.0.1:7788/wait_prompt?since=12&timeout_ms=30000"
 ```
 
 - `awaiting:false` 时返回 `{"actions":[],"awaiting":false,...,"reason":"not awaiting"}`；
+- **选卡/攻击目标**（`MSG_SELECT_CARD/TRIBUTE/UNSELECT_CARD`）：
+  - `selectMin<=1` 时**每个候选一条** `kind:"select_card"`、`index=i`，label 形如 `attack target: card #1 code=1500 atk=1500 def=1200 loc=4 seq=0`（战斗目标窗会带 `attack target:` 前缀）；另有一条 `kind:"select_auto"`（`auto: pick first N card(s)`）作兜底；
+  - `selectMin>1` 时只有 `select_auto`（自动选前 N 张）；
+  - `/prompt.selectableCards[]` 含 `atk/def/position/seqNo`，且 `MSG_SELECT_CARD && selectMax==1 && 战斗阶段` 时 `/prompt.isAttackTarget=true`；
+  - `/act_id?id=0` 在单目标时等价于 `select_card(index=0)`（保持旧行为）；多目标请显式选 `select_card` 的 id。
 - `curMsg/seq` 与 `/prompt` 一致（prompt 快照）。
 
 `/act_id?id=<id>[&seq=<seq>]`：提交上表中的一个动作；成功 `{"ok":true,"queued":true}`。

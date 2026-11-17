@@ -217,7 +217,7 @@ void AppendCands(std::ostringstream& os, const std::vector<CandSnap>& v) {
 		if (i) os << ',';
 		const auto& c = v[i];
 		os << "{\"i\":" << i << ",\"code\":" << c.code << ",\"atk\":" << c.atk << ",\"def\":" << c.def
-		   << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq << ",\"seqNo\":" << c.seqNo << ",\"op\":" << c.opParam << ",\"lv\":" << c.level << ",\"rk\":" << c.rank << ",\"ty\":" << c.type << ",\"desc\":" << c.desc
+		   << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq << ",\"seqNo\":" << c.seqNo << ",\"position\":" << c.position << ",\"op\":" << c.opParam << ",\"lv\":" << c.level << ",\"rk\":" << c.rank << ",\"ty\":" << c.type << ",\"desc\":" << c.desc
 		   << ",\"ctrl\":" << c.ctrl << ",\"forced\":" << (c.forced ? "true" : "false") << '}';
 	}
 	os << ']';
@@ -261,6 +261,8 @@ std::string PromptJson(const Snapshot& s) {
 	   << ",\"lastChain\":" << (s.lastChain ? "true" : "false")
 	   << ",\"selectMin\":" << s.selectMin
 	   << ",\"selectMax\":" << s.selectMax
+	   // task-53: battle target window marker (MSG_SELECT_CARD, single target, battle phase)
+	   << ",\"isAttackTarget\":" << ((s.curMsg == MSG_SELECT_CARD && s.selectMax == 1 && (s.phase & PHASE_BATTLE)) ? "true" : "false")
 	   // task-50: only present for MSG_ANNOUNCE_NUMBER (LLM picks one value)
 	   << ",\"announceNumberValues\":[";
 	for (size_t i = 0; i < s.announceNumberValues.size(); ++i) {
@@ -680,6 +682,7 @@ void SnapshotFromClient(Snapshot& s) {
 		cs.loc = pc->location;
 		cs.seq = pc->sequence;
 		cs.seqNo = pc->select_seq;
+		cs.position = pc->position;
 		cs.opParam = pc->opParam;
 		cs.level = pc->level;
 		cs.rank = pc->rank;

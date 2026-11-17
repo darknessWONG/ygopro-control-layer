@@ -1575,6 +1575,12 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 						MsgName(cur.pendingKind > 0 ? cur.realCurMsg : cur.curMsg),
 						cur.curMsg, MsgName(cur.curMsg), cur.curMsg, dcur,
 						cur.selectMin, cur.selectMax, (int)bytes.size(), ival, hex.c_str());
+					if (acts[id].kind == "select_card" && acts[id].index >= 0 &&
+						acts[id].index < (int)cur.selectableList.size()) {
+						const CandSnap& picked = cur.selectableList[acts[id].index];
+						Control::Log("SEND RESPONSE picked=%d code=%u loc=%d seq=%d seqNo=%u (select_card)",
+							acts[id].index, picked.code, picked.loc, picked.seq, picked.seqNo);
+					}
 					act.i = ival;
 					act.bytes = bytes;
 					if (g_uiActions) {
@@ -2537,7 +2543,7 @@ static void PromptIdlePump(uint64_t now) {
 	case MSG_SELECT_BATTLECMD: ai = pickKind("end_battle", -1); break;
 	case MSG_SELECT_CARD:
 	case MSG_SELECT_TRIBUTE:
-	case MSG_SELECT_UNSELECT_CARD: ai = pickKind("select", -1); break;
+	case MSG_SELECT_UNSELECT_CARD: ai = pickKind("select_auto", -1); if (ai < 0) ai = pickKind("select", -1); break;
 	case MSG_SELECT_PLACE:
 	case MSG_SELECT_DISFIELD: ai = pickKind("place", -1); break;
 	case MSG_SELECT_POSITION: ai = pickKind("position", 0x01); break;

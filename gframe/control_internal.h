@@ -83,6 +83,7 @@ struct CandSnap {
 	int seq{ 0 };
 	int desc{ 0 };
 	int ctrl{ 0 };
+	int position{ 0 }; // ClientCard::position flags (0x1 attack / 0x2 defense, etc.)
 	bool forced{ false };
 	unsigned seqNo{ 0 };
 	unsigned opParam{ 0 };
