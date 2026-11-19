@@ -155,6 +155,9 @@ bool g_readySent = false;
 std::atomic<bool> g_snapshotWanted{ false };
 bool g_promptWanted = false;
 int g_timeLeft = -1;
+// task-54: when g_timeLeft was last refreshed. g_timeLeft is NOT reset between turns, so using it
+// directly as "clock running" disabled the passive dead detector forever after one time-limit packet.
+std::atomic<uint64_t> g_timeLeftTick{ 0 };
 int g_turnPlayer = -1;
 int g_turnPlayerLocal = -1;
 std::deque<int> g_msgTrail; // task-28c: recent game-message ids (ranked stall diagnostics)
@@ -711,6 +714,12 @@ std::string NetJson() {
 	   << ",\"lastStocAt\":" << (unsigned long long)last
 	   << ",\"lastStocName\":\"" << StocName(g_lastStocId.load()) << '"'
 	   << ",\"sinceLastStoc\":" << since
+	   // task-54: make the passive watchdog state visible to LLMs/scripts
+	   << ",\"ourTurn\":" << (g_turnPlayerLocal == 0 ? "true" : "false")
+	   << ",\"oppTurn\":" << (g_turnPlayerLocal > 0 ? "true" : "false")
+	   << ",\"timeLeft\":" << g_timeLeft
+	   << ",\"clockFresh\":" << ((g_timeLeft > 0 && g_timeLeftTick.load() > 0 &&
+			GetTickCount64() - g_timeLeftTick.load() < 3000) ? "true" : "false")
 	   << ",\"alive\":" << (alive ? "true" : "false")
 	   << ",\"state\":\"" << NetStateToStr(stateCode) << '"'
 	   << ",\"uptimeMs\":" << (unsigned long long)g_netAliveSince.load()
@@ -1121,18 +1130,31 @@ static void NetPumpProber(uint64_t now) {
 	}
 	const bool oppTurn = (g_turnPlayerLocal >= 0 && g_turnPlayerLocal != 0);
 	const bool ourTurn = (g_turnPlayerLocal == 0);
-	const bool clockRunning = (g_timeLeft > 0);
+	// task-54: g_timeLeft is not reset between turns; only treat it as "our clock running" when it
+	// was refreshed recently (server sends STOC_TIME_LIMIT updates while it waits for us).
+	const uint64_t tlTick = g_timeLeftTick.load();
+	const bool clockFresh = (g_timeLeft > 0 && tlTick > 0 && now - tlTick < 3000);
+	const bool clockRunning = (ourTurn && clockFresh);
 	const bool quiet = !awaitingNow && !actionsPending && !g_uiPending.active;
 	long long effSilence = silenceMs;
 	if (oppTurn && quiet && effSilence < 60000) effSilence = 60000;
-	// task-48: NEVER passive-kill on our own turn / while our clock is running: the server simply
-	// has nothing to send while we think. (This false positive got users kicked at 10s.)
-	if (ourTurn || clockRunning) {
+	// task-48: never passive-kill while it is our turn AND our clock is actually ticking.
+	if (ourTurn && clockFresh) {
 		static uint64_t lastAliveDiag = 0;
 		if (now - lastAliveDiag >= 15000 && since > 10000) {
 			lastAliveDiag = now;
-			Control::Log("NET ALIVE reason=our-turn-idle since=%lldms timeLeft=%d awaiting=%d",
-				since, g_timeLeft, awaitingNow ? 1 : 0);
+			Control::Log("NET ALIVE reason=our-turn-idle since=%lldms timeLeft=%d awaiting=%d clockFresh=%d",
+				since, g_timeLeft, awaitingNow ? 1 : 0, clockFresh ? 1 : 0);
+		}
+	}
+	// task-54: heartbeat so LLM/human can see the watchdog is still checking (every 15s)
+	if (since > 10000) {
+		static uint64_t lastHeartbeat = 0;
+		if (now - lastHeartbeat >= 15000) {
+			lastHeartbeat = now;
+			Control::Log("NET heartbeat alive=%d state=%s since=%lldms ourTurn=%d oppTurn=%d awaiting=%d timeLeft=%d clockFresh=%d",
+				g_netAlive.load() ? 1 : 0, NetStateToStr(g_netState.load()), since,
+				ourTurn ? 1 : 0, oppTurn ? 1 : 0, awaitingNow ? 1 : 0, g_timeLeft, clockFresh ? 1 : 0);
 		}
 	}
 	// periodic diagnostic when the server stays silent (helps distinguish server bug vs AFK)
@@ -1140,16 +1162,16 @@ static void NetPumpProber(uint64_t now) {
 		static uint64_t lastSilenceDiag = 0;
 		if (now - lastSilenceDiag >= 15000) {
 			lastSilenceDiag = now;
-			Control::Log("NET silence diag since=%lldms oppTurn=%d ourTurn=%d awaiting=%d lastStoc=%s timeLeft=%d effSilence=%lldms",
+			Control::Log("NET silence diag since=%lldms oppTurn=%d ourTurn=%d awaiting=%d lastStoc=%s timeLeft=%d clockFresh=%d effSilence=%lldms",
 				since, oppTurn ? 1 : 0, ourTurn ? 1 : 0, awaitingNow ? 1 : 0, StocName(g_lastStocId.load()),
-				g_timeLeft, effSilence);
+				g_timeLeft, clockFresh ? 1 : 0, effSilence);
 		}
 	}
-	if (!ourTurn && !clockRunning && since > effSilence && now - g_netAliveSince.load() > 2500) {
+	if (!clockRunning && since > effSilence && now - g_netAliveSince.load() > 2500) {
 		if (quiet && g_netAlive.exchange(false)) {
 			g_netState.store(NET_STATE_CONFIRMED_DEAD);
-			Control::Log("NET DEAD reason=idle-no-packet since=%lldms eff=%lldms oppTurn=%d",
-				since, effSilence, oppTurn ? 1 : 0);
+			Control::Log("NET DEAD reason=idle-no-packet since=%lldms eff=%lldms oppTurn=%d ourTurn=%d clockFresh=%d",
+				since, effSilence, oppTurn ? 1 : 0, ourTurn ? 1 : 0, clockFresh ? 1 : 0);
 		}
 	}
 	// ---- healthy/idle bookkeeping (single source of truth) --------------
@@ -2116,7 +2138,11 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 	if (pktType == STOC_TIME_LIMIT) {
 		uint8_t who = (data && len >= 1) ? data[0] : 0xFF;
 		int left = (data && len >= 4) ? (int)(data[2] | (data[3] << 8)) : -1;
-		if (left >= 0 && (int)who == (int)(DuelClient::selftype & 1)) { std::lock_guard<std::mutex> lk(g_mutex); g_timeLeft = left; }
+		if (left >= 0 && (int)who == (int)(DuelClient::selftype & 1)) {
+			std::lock_guard<std::mutex> lk(g_mutex);
+			g_timeLeft = left;
+			g_timeLeftTick.store(GetTickCount64());
+		}
 	}
 	std::lock_guard<std::mutex> lk(g_mutex);
 	g_stocRing.push_back((int)pktType);

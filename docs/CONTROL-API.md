@@ -336,8 +336,12 @@ curl.exe -s -X POST "http://127.0.0.1:7788/start"
 | `alive` `state` | 是否存活 + 状态机：`healthy` / `probe_failed` / `confirmed_dead` / `disconnected` / `unsupported` / `idle` |
 | `closeReason` | `none` / `eof` / `stop` / … |
 | `lastStocAt` `lastStocName` `sinceLastStoc` | 最近一条 STOC 包时间/类型/距今毫秒 |
+| `ourTurn` `oppTurn` `timeLeft` `clockFresh` | 看门狗诊断：是否我方/对手回合、我方剩余时间、该时间是否在 3s 内刚刷新（`clockFresh=false` 表示 `timeLeft` 是旧值，不构成豁免） |
 | `probe:{enabled,unsupported,lastSentAt,lastReplyAt,rttMs,fails,lastReplyPlayerType,lastReplyText}` | `/tip` 探活细节 |
 | `lastNetMsg:{id,text,ageMs}` | 最近一条服务器消息 |
+
+> 看门狗：对局中静默超过 `YGO_NET_DEAD_SILENCE_MS`（默认 60000）、且不是"我方回合 + 倒计时在刷新"、且没有 awaiting/queued action → `confirmed_dead`。每 15s 打 `NET heartbeat alive=.. state=.. since=.. ourTurn=.. oppTurn=.. awaiting=.. timeLeft=.. clockFresh=..`，可用它确认"检查仍在进行"。
+> **不要**再长期设置 `YGO_NET_DEAD_SILENCE_MS=600000`（那会让真掉线 10 分钟才发现）；probe 误判已修（probe 失败只降级状态），建议默认 60000 或最多 120000。
 
 `/net/probe` 主动探一次（默认自动探活已开启）：`{"ok":<有回包>,"sent":..,"rttMs":..,"alive":..,"fails":..,"lastReplyPlayerType":..}`。
 
