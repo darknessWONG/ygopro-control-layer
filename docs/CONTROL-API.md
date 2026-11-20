@@ -337,10 +337,12 @@ curl.exe -s -X POST "http://127.0.0.1:7788/start"
 | `closeReason` | `none` / `eof` / `stop` / … |
 | `lastStocAt` `lastStocName` `sinceLastStoc` | 最近一条 STOC 包时间/类型/距今毫秒 |
 | `ourTurn` `oppTurn` `timeLeft` `clockFresh` | 看门狗诊断：是否我方/对手回合、我方剩余时间、该时间是否在 3s 内刚刷新（`clockFresh=false` 表示 `timeLeft` 是旧值，不构成豁免） |
+| `stallMs` `oppTimeLeft` `oppClockFresh` | **卡死诊断**：`stallMs`=对局中无入站 STOC 的毫秒数；`oppClockFresh`=对手倒计时 3s 内刚刷新（true=对手在正常思考；false=对手/服务端可能卡住）。`stallMs>120000 && oppClockFresh=false` 表示"对方客户端/服务端卡住"，LLM 应离桌重排而不是继续等 |
 | `probe:{enabled,unsupported,lastSentAt,lastReplyAt,rttMs,fails,lastReplyPlayerType,lastReplyText}` | `/tip` 探活细节 |
 | `lastNetMsg:{id,text,ageMs}` | 最近一条服务器消息 |
 
 > 看门狗：对局中静默超过 `YGO_NET_DEAD_SILENCE_MS`（默认 60000）、且不是"我方回合 + 倒计时在刷新"、且没有 awaiting/queued action → `confirmed_dead`。每 15s 打 `NET heartbeat alive=.. state=.. since=.. ourTurn=.. oppTurn=.. awaiting=.. timeLeft=.. clockFresh=..`，可用它确认"检查仍在进行"。
+> 卡死告警：`inDuel` 且无入站超过 `YGO_STALL_WARN_MS`（默认 120000）时每 30s 打 `NET STALL since=.. awaiting=.. ourTurn=.. oppClockFresh=.. oppTimeLeft=.. state=..`；`oppClockFresh=false` 说明**不是对手长考**，而是对方卡住/服务端不推进。
 > **不要**再长期设置 `YGO_NET_DEAD_SILENCE_MS=600000`（那会让真掉线 10 分钟才发现）；probe 误判已修（probe 失败只降级状态），建议默认 60000 或最多 120000。
 
 `/net/probe` 主动探一次（默认自动探活已开启）：`{"ok":<有回包>,"sent":..,"rttMs":..,"alive":..,"fails":..,"lastReplyPlayerType":..}`。
@@ -540,6 +542,7 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 | `YGO_NET_PROBE_GAP_MS` | `3000` | 两次探活最小间隔 |
 | `YGO_NET_PROBE_WINDOW_MS` | `1500` | 探活回包等待窗口 |
 | `YGO_NET_DEAD_SILENCE_MS` | `60000` | 被动静默判死阈值；**我方回合或我方倒计时在走时永不判死**（日志 `NET ALIVE reason=our-turn-idle`），判死日志 `NET DEAD reason=idle-no-packet` |
+| `YGO_STALL_WARN_MS` | `120000` | 卡死诊断告警阈值：对局中无入站 STOC 超过该值后每 30s 打 `NET STALL ... oppClockFresh=..`（仅日志/诊断，不影响判死） |
 | `YGO_TP_AUTO` | `1` | 先/后攻询问若 2s 内没有外部 `/act_id kind=tp`，自动作答（防服务端 13s eof）；`0` 关闭 |
 | `YGO_TP_AUTO_RES` | `2` | 自动答的值：`1`=先攻、`2`=后攻 |
 | `YGO_PROMPT_AUTO_DEFAULT_MS` | `60000` | **prompt 空闲兜底**：控制驱动下若已发布 prompt 且超过该时间没有任何 `CTOS_RESPONSE`，自动发保守默认动作。**服务端 AFK 约 90s 会 eof 踢人**；本 guard 在 60s（默认）先答掉，避免意外 EOF。`0` 关闭。日志 `PROMPT auto-default msg=.. seq=.. kind=.. after=..ms (idle guard, LLM silent)` |

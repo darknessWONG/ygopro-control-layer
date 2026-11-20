@@ -158,6 +158,9 @@ int g_timeLeft = -1;
 // task-54: when g_timeLeft was last refreshed. g_timeLeft is NOT reset between turns, so using it
 // directly as "clock running" disabled the passive dead detector forever after one time-limit packet.
 std::atomic<uint64_t> g_timeLeftTick{ 0 };
+// task-55: opponent clock (STOC_TIME_LIMIT with who != our seat) for stall diagnosis
+int g_oppTimeLeft = -1;
+std::atomic<uint64_t> g_oppTimeLeftTick{ 0 };
 int g_turnPlayer = -1;
 int g_turnPlayerLocal = -1;
 std::deque<int> g_msgTrail; // task-28c: recent game-message ids (ranked stall diagnostics)
@@ -720,6 +723,11 @@ std::string NetJson() {
 	   << ",\"timeLeft\":" << g_timeLeft
 	   << ",\"clockFresh\":" << ((g_timeLeft > 0 && g_timeLeftTick.load() > 0 &&
 			GetTickCount64() - g_timeLeftTick.load() < 3000) ? "true" : "false")
+	   // task-55: stall diagnostics (server/opponent stopped sending while we are not dead)
+	   << ",\"stallMs\":" << ((inDuel && since >= 0) ? since : -1)
+	   << ",\"oppTimeLeft\":" << g_oppTimeLeft
+	   << ",\"oppClockFresh\":" << ((g_oppTimeLeft > 0 && g_oppTimeLeftTick.load() > 0 &&
+			GetTickCount64() - g_oppTimeLeftTick.load() < 3000) ? "true" : "false")
 	   << ",\"alive\":" << (alive ? "true" : "false")
 	   << ",\"state\":\"" << NetStateToStr(stateCode) << '"'
 	   << ",\"uptimeMs\":" << (unsigned long long)g_netAliveSince.load()
@@ -1138,6 +1146,24 @@ static void NetPumpProber(uint64_t now) {
 	const bool quiet = !awaitingNow && !actionsPending && !g_uiPending.active;
 	long long effSilence = silenceMs;
 	if (oppTurn && quiet && effSilence < 60000) effSilence = 60000;
+	// task-55: stall diagnostic. If no inbound STOC for a long time AND the opponent clock is not
+	// refreshing, the opponent client/server is stuck (not our disconnect, not a long think) -> the
+	// LLM should leave and re-queue instead of waiting.
+	{
+		const char* swEnv = std::getenv("YGO_STALL_WARN_MS");
+		const long long stallWarn = swEnv ? (long long)atoll(swEnv) : 120000;
+		const uint64_t ott = g_oppTimeLeftTick.load();
+		const bool oppClockFresh = (g_oppTimeLeft > 0 && ott > 0 && now - ott < 3000);
+		if (stallWarn > 0 && since > stallWarn) {
+			static uint64_t lastStallLog = 0;
+			if (now - lastStallLog >= 30000) {
+				lastStallLog = now;
+				Control::Log("NET STALL since=%lldms awaiting=%d ourTurn=%d oppClockFresh=%d oppTimeLeft=%d state=%s",
+					since, awaitingNow ? 1 : 0, ourTurn ? 1 : 0, oppClockFresh ? 1 : 0,
+					g_oppTimeLeft, NetStateToStr(g_netState.load()));
+			}
+		}
+	}
 	// task-48: never passive-kill while it is our turn AND our clock is actually ticking.
 	if (ourTurn && clockFresh) {
 		static uint64_t lastAliveDiag = 0;
@@ -2142,6 +2168,11 @@ void Control::OnStocPacket(unsigned char pktType, const unsigned char* data, siz
 			std::lock_guard<std::mutex> lk(g_mutex);
 			g_timeLeft = left;
 			g_timeLeftTick.store(GetTickCount64());
+		} else if (left >= 0) {
+			// task-55: opponent time-limit updates prove the opponent client is still thinking
+			std::lock_guard<std::mutex> lk(g_mutex);
+			g_oppTimeLeft = left;
+			g_oppTimeLeftTick.store(GetTickCount64());
 		}
 	}
 	std::lock_guard<std::mutex> lk(g_mutex);
