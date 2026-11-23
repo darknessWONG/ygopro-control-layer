@@ -52,7 +52,7 @@ YGOPro.exe
 - 控制层每发布一个 prompt 就 `seq++`；`awaiting:true` 表示**有一个 prompt 正等着你回答**。
 - 回答方式只有两种：`/act_id?id=<动作 id>`（推荐）或 `/act?seq=&i=|hex=`（底层）。
 - 回答后 `awaiting=false`；**做动作时必须带对 `seq`**（`/act` 会校验，`/act_id` 自动用当前 seq）。
-- 等待新 prompt 用 `/wait_prompt?since=<上次的 seq>`：返回时 `seq>since` 或 `awaiting=false`。
+- 等待新 prompt 用 `/wait_prompt?since=<上次的 seq>`：**阻塞到"新的、真正 awaiting 的 prompt"才返回**（`seq>since && awaiting`）；超时则返回当前最新快照。没有待答 prompt 时不会立刻返回旧快照（旧版 `|| !awaiting` 的 bug 已修）。
 
 ### 2.3 prompt 快照
 
@@ -87,7 +87,7 @@ curl.exe -s http://127.0.0.1:7788/health
 | 胜负 | `winPlayer`（raw）、`winPlayerLocal`（0=我方赢/1=对手赢/-1=平局或未知）、`isWin` `isLoss` `isDraw`、`winReason` `winReasonName` |
 | 整场（Bo3） | `match:{game,over,games:[{game,win,winnerSeat,reason,reasonName}],gamesWonLocal,gamesWonOpp,lastWinnerLocal,lastReasonName}`：`game`=当前第几局（`STOC_DUEL_START` 计数），`over`=`STOC_DUEL_END` 已收到；`win` 为我方视角，`winnerSeat` 为 raw 座位（0/1，调试用）；无结果时 `lastWinnerLocal/lastReasonName` 为 `null` |
 | 计数 | `counts:{hand:[我,对],grave:[...],remove:[...],deck:[...],extra:[...]}` |
-| 手牌/场面 | `hand`、`monsters`、`spells`、`grave`、`banished`：数组 `[我方, 对手]`；`extraDeck` 单数组；每张卡 `{code,atk,def,pos,faceup,hidden,ty,lv,name,loc,seq}`（`hidden=true` 时 `code/lv/name` 置空） |
+| 手牌/场面 | `hand`、`monsters`、`spells`、`grave`、`banished`：数组 `[我方, 对手]`；`extraDeck` 单数组；每张卡 `{code,atk,def,pos,faceup,hidden,ty,lv,name,loc,seq,ctrl,isMine}`（`hidden=true` 时 `code/lv/name` 置空；`ctrl`=原始控制者座位，`isMine`=本地视角是否我方） |
 | 连锁 | `chainDepth` `chainStack` `chainingTo` `chainCandidates` `canDecline` `hint` `lastChainEvent`；另有可读的 `activeEffects`（链栈文本）、`continuousEffects`（永续效果卡） |
 | UI | `chainMode` `uiCleanupCount` `ui:{chainMode,chainModeName,alwaysChain,chainWhenAvail,ignoreChain,desiredChainMode,desiredChainModeName,appliedChainMode,applyPending,uiCleanupCount,popupMask,popups:{posSelect,options,cardSelect,cmdMenu,message},windows:[...],windowsVisible:[...]}` |
 | 管线 | `pipeline:{analyzeCount,pumpCount,msgCount,seq,awaiting,lastStoc,lastStocName,sinceLastAnalyzeMs,sinceLastPumpMs,retryCount,lastRetryAfterMsg,lastNonRetryMsg,retryStreak,placeVariant,autoDismiss,dismissCount,recentMsgs}` + 顶层别名 `retryCount` `retryStreak` `placeVariant` `lastMsg:{id,len,hex}` |
@@ -139,7 +139,7 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
 | `tpPending` `tpOptions` `tpChooseBy` | **仅先/后攻选择时出现**（见 §3.5）；`tpOptions:[1,2]`，1=先攻、2=后攻 |
 | `announceNumberValues` | **仅 `MSG_ANNOUNCE_NUMBER(143)` 时出现**：可用数值列表（int32）；`/actions` 为每个值给一条 `kind:"announce_number"`，选中后响应 = **数值本身**（不是下标）。`MSG_ANNOUNCE_RACE/ATTRIB` 用 `kind:"announce_race"/"announce_attrib"`（int32 位掩码），`MSG_ANNOUNCE_CARD` 用 `kind:"announce_card"`（int32 卡号） |
 | `summonable` `spsummonable` `msetable` `ssetable` `reposable` `activatable` `attackable` | 各类可动作数量 |
-| `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,op,lv,rk,ty,desc,ctrl,forced}` |
+| `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,resp,position,op,lv,rk,ty,desc,ctrl,isMine,name,forced}`；**响应字节用 `seqNo`/`resp`（=select_seq），不是列表下标 `i`** |
 | `chains` / `chainDepth` / `chainStack` / `chainingTo` / `chainCandidates` / `canDecline` / `hint` / `lastChainEvent` | 连锁相关（`chainCandidates` 为空表示"只能不连锁"） |
 | `selectMin` `selectMax` `selectCancelable` `selectableCount` | 选卡类约束 |
 | `canBp` `canEp` | 是否可进战阶/结束阶段 |

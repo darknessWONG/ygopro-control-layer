@@ -1658,7 +1658,9 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			if (timeout <= 0) timeout = 30000;
 			std::unique_lock<std::mutex> lk(g_mutex);
 			g_cv.wait_for(lk, std::chrono::milliseconds(timeout), [since]() {
-				return g_seq > since || !g_awaiting;
+				// task-56: only a NEW, actually-awaiting prompt counts. The old "|| !g_awaiting"
+				// returned a stale snapshot immediately whenever nothing was pending.
+				return g_seq > since && g_awaiting;
 			});
 			// task-28f: report the frozen prompt state while awaiting (same source as /prompt)
 			body = PromptJson(g_awaiting && g_promptSnapValid.load() ? g_promptSnap : g_shared);

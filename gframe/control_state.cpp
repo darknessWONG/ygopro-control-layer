@@ -169,6 +169,8 @@ void FillCard(std::vector<CardSnap>& out, ClientCard* c, int owner, int myPlayer
 	s.position = c->position;
 	s.location = c->location;
 	s.sequence = c->sequence;
+	s.ctrl = c->controler;
+	s.isMine = (owner == myPlayer); // dField is local-indexed: owner 0 == us
 	if (!s.hidden) {
 		const CardDataC* cd = nullptr;
 		auto it = dataManager.GetCodePointer(c->code);
@@ -196,6 +198,7 @@ void AppendCard(std::ostringstream& os, const CardSnap& c) {
 	os << "{\"code\":" << c.code << ",\"atk\":" << c.attack << ",\"def\":" << c.defense
 	   << ",\"pos\":" << c.position << ",\"faceup\":" << (c.faceup ? "true" : "false")
 	   << ",\"hidden\":" << (c.hidden ? "true" : "false")
+	   << ",\"ctrl\":" << c.ctrl << ",\"isMine\":" << (c.isMine ? "true" : "false")
 	   << ",\"ty\":" << c.type << ",\"lv\":" << c.level << ",\"name\":\"";
 	for (size_t k = 0; k < c.name.size(); ++k) { char ch = c.name[k]; if (ch == 34 || ch == 92) os << 92 << ch; else os << ch; }
 	os << "\"";
@@ -217,8 +220,14 @@ void AppendCands(std::ostringstream& os, const std::vector<CandSnap>& v) {
 		if (i) os << ',';
 		const auto& c = v[i];
 		os << "{\"i\":" << i << ",\"code\":" << c.code << ",\"atk\":" << c.atk << ",\"def\":" << c.def
-		   << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq << ",\"seqNo\":" << c.seqNo << ",\"position\":" << c.position << ",\"op\":" << c.opParam << ",\"lv\":" << c.level << ",\"rk\":" << c.rank << ",\"ty\":" << c.type << ",\"desc\":" << c.desc
-		   << ",\"ctrl\":" << c.ctrl << ",\"forced\":" << (c.forced ? "true" : "false") << '}';
+		   << ",\"loc\":" << c.loc << ",\"seq\":" << c.seq << ",\"seqNo\":" << c.seqNo
+		   // task-56: "resp" is the byte the response must carry for this candidate
+		   // (select_seq); the list index "i" is NOT the response value.
+		   << ",\"resp\":" << c.seqNo
+		   << ",\"position\":" << c.position << ",\"op\":" << c.opParam << ",\"lv\":" << c.level << ",\"rk\":" << c.rank << ",\"ty\":" << c.type << ",\"desc\":" << c.desc
+		   << ",\"ctrl\":" << c.ctrl << ",\"isMine\":" << (c.isMine ? "true" : "false")
+		   << ",\"name\":\"" << JsonEscape(c.name) << '"'
+		   << ",\"forced\":" << (c.forced ? "true" : "false") << '}';
 	}
 	os << ']';
 }
@@ -605,7 +614,8 @@ void SnapshotFromClient(Snapshot& s) {
 	// dField is indexed from the LOCAL player perspective (0 = me, 1 = opponent) whatever our seat.
 	// Keep the real seat separately for lobby / seat-dependent encoding.
 	s.myPlayer = 0;
-	s.mySeat = (int)mainGame->dInfo.player_type;
+	s.mySeat = SelfSeat(); // task-56: use the control-layer seat (raw dInfo.player_type was equal
+	                       // in practice but the ctrl/isMine comparison must use the real seat)
 	auto& f = mainGame->dField;
 	for (int i = 0; i < 2; ++i) {
 		for (auto* c : f.hand[i]) FillCard(s.hand[i], c, i, s.myPlayer);
@@ -673,7 +683,8 @@ void SnapshotFromClient(Snapshot& s) {
 	if (s.curMsg == MSG_ANNOUNCE_NUMBER) CopyAnnounceValues(s.announceNumberValues);
 	s.sumTarget = f.select_sumval;
 	s.sumMode = f.select_mode;
-	auto addCard = [](std::vector<CandSnap>& out, ClientCard* pc) {
+	const int mySeatNow = s.mySeat; // task-56: real seat for ctrl/isMine
+	auto addCard = [mySeatNow](std::vector<CandSnap>& out, ClientCard* pc) {
 		if (!pc) return;
 		CandSnap cs;
 		cs.code = pc->code;
@@ -687,6 +698,9 @@ void SnapshotFromClient(Snapshot& s) {
 		cs.level = pc->level;
 		cs.rank = pc->rank;
 		cs.type = pc->type;
+		cs.ctrl = pc->controler;
+		cs.isMine = (pc->controler == mySeatNow);
+		cs.name = CardNameOf(pc->code);
 		// hand / extra-deck cards often carry no data yet: fill type/level/atk/def from cards.cdb
 		if (cs.level == 0 || cs.type == 0) {
 			auto it = dataManager.GetCodePointer(pc->code);

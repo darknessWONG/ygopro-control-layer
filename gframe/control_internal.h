@@ -73,6 +73,8 @@ struct CardSnap {
 	unsigned type{ 0 };
 	unsigned level{ 0 };
 	std::string name;
+	int ctrl{ 0 };        // task-56: raw controller seat
+	bool isMine{ false }; // task-56: local-view mine
 };
 
 struct CandSnap {
@@ -90,6 +92,8 @@ struct CandSnap {
 	unsigned level{ 0 };
 	unsigned rank{ 0 };
 	unsigned type{ 0 };
+	bool isMine{ false }; // task-56: pc->controler == our seat
+	std::string name;     // task-56: resolved card name (empty when unknown)
 };
 
 // task-19: chain semantics exposed to the MCP/LLM
