@@ -545,6 +545,8 @@ void NetOnJoined();
 void NetOnDisconnected(const char* reason);
 void NotifyUserImpl(int msgId, const char* tag);
 std::string JsonEscape(const std::string& s); // defined in control_state.cpp
+// task-57: local-view player index -> server seat for API output
+int ToServerSeat(int localCtrl, int mySeat);
 
 } // namespace ctl
 } // namespace ygo

@@ -602,7 +602,7 @@ void CaptureChainAnalyze() {
 		if (!pc) continue;
 		ChainCandRaw r;
 		r.code = pc->code;
-		r.ctrl = pc->controler;
+		r.ctrl = ToServerSeat(pc->controler, SelfSeat());
 		r.loc = pc->location;
 		r.seq = (int)i; // message order == response index
 		if (i < f.activatable_descs.size()) {

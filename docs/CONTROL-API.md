@@ -59,6 +59,11 @@ YGOPro.exe
 `awaiting:true` 期间，`/prompt`、`/actions`、`/wait_prompt` 返回的是**该 prompt 发布瞬间冻结的快照**
 （不是"最新到达的消息"），保证 `curMsg`/候选列表与你要回答的问题一致。
 
+> **座位坐标约定**（task-57）：`myPlayer` 恒为 0，只是 `hand[0]`/`monsters[0]` 等数组的**本地索引视角**；
+> 对外 `ctrl` 一律是**服务端座位**，且恒有 `isMine == (ctrl == mySeat)`。双方都是 guest 时
+> `mySeat=1`，此时自己的卡 `ctrl=1/isMine=true`、对手的卡 `ctrl=0/isMine=false`。
+> 需要看本地视角原值时用 `ctrlRaw`（仅 `places[]` 输出）。
+
 ---
 
 ## 3. 端点
@@ -87,7 +92,7 @@ curl.exe -s http://127.0.0.1:7788/health
 | 胜负 | `winPlayer`（raw）、`winPlayerLocal`（0=我方赢/1=对手赢/-1=平局或未知）、`isWin` `isLoss` `isDraw`、`winReason` `winReasonName` |
 | 整场（Bo3） | `match:{game,over,games:[{game,win,winnerSeat,reason,reasonName}],gamesWonLocal,gamesWonOpp,lastWinnerLocal,lastReasonName}`：`game`=当前第几局（`STOC_DUEL_START` 计数），`over`=`STOC_DUEL_END` 已收到；`win` 为我方视角，`winnerSeat` 为 raw 座位（0/1，调试用）；无结果时 `lastWinnerLocal/lastReasonName` 为 `null` |
 | 计数 | `counts:{hand:[我,对],grave:[...],remove:[...],deck:[...],extra:[...]}` |
-| 手牌/场面 | `hand`、`monsters`、`spells`、`grave`、`banished`：数组 `[我方, 对手]`；`extraDeck` 单数组；每张卡 `{code,atk,def,pos,faceup,hidden,ty,lv,name,loc,seq,ctrl,isMine}`（`hidden=true` 时 `code/lv/name` 置空；`ctrl`=原始控制者座位，`isMine`=本地视角是否我方） |
+| 手牌/场面 | `hand`、`monsters`、`spells`、`grave`、`banished`：数组 `[我方, 对手]`（**本地视角**：`hand[0]` 永远是自己的手牌）；`extraDeck` 单数组；每张卡 `{code,atk,def,pos,faceup,hidden,ty,lv,name,loc,seq,ctrl,isMine}`（`hidden=true` 时 `code/lv/name` 置空；**`ctrl` 为服务端座位**，`isMine == (ctrl == mySeat)`）；`myPlayer` 恒 0 只是 `hand[x]` 的本地索引视角，与 `ctrl/mySeat` 无关 |
 | 连锁 | `chainDepth` `chainStack` `chainingTo` `chainCandidates` `canDecline` `hint` `lastChainEvent`；另有可读的 `activeEffects`（链栈文本）、`continuousEffects`（永续效果卡） |
 | UI | `chainMode` `uiCleanupCount` `ui:{chainMode,chainModeName,alwaysChain,chainWhenAvail,ignoreChain,desiredChainMode,desiredChainModeName,appliedChainMode,applyPending,uiCleanupCount,popupMask,popups:{posSelect,options,cardSelect,cmdMenu,message},windows:[...],windowsVisible:[...]}` |
 | 管线 | `pipeline:{analyzeCount,pumpCount,msgCount,seq,awaiting,lastStoc,lastStocName,sinceLastAnalyzeMs,sinceLastPumpMs,retryCount,lastRetryAfterMsg,lastNonRetryMsg,retryStreak,placeVariant,autoDismiss,dismissCount,recentMsgs}` + 顶层别名 `retryCount` `retryStreak` `placeVariant` `lastMsg:{id,len,hex}` |
@@ -139,11 +144,11 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
 | `tpPending` `tpOptions` `tpChooseBy` | **仅先/后攻选择时出现**（见 §3.5）；`tpOptions:[1,2]`，1=先攻、2=后攻 |
 | `announceNumberValues` | **仅 `MSG_ANNOUNCE_NUMBER(143)` 时出现**：可用数值列表（int32）；`/actions` 为每个值给一条 `kind:"announce_number"`，选中后响应 = **数值本身**（不是下标）。`MSG_ANNOUNCE_RACE/ATTRIB` 用 `kind:"announce_race"/"announce_attrib"`（int32 位掩码），`MSG_ANNOUNCE_CARD` 用 `kind:"announce_card"`（int32 卡号） |
 | `summonable` `spsummonable` `msetable` `ssetable` `reposable` `activatable` `attackable` | 各类可动作数量 |
-| `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,resp,position,op,lv,rk,ty,desc,ctrl,isMine,name,forced}`；**响应字节用 `seqNo`/`resp`（=select_seq），不是列表下标 `i`** |
+| `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,resp,position,op,lv,rk,ty,desc,ctrl,isMine,name,forced}`；**响应字节用 `seqNo`/`resp`（=select_seq），不是列表下标 `i`**；`ctrl` 为服务端座位且 `isMine == (ctrl == mySeat)` |
 | `chains` / `chainDepth` / `chainStack` / `chainingTo` / `chainCandidates` / `canDecline` / `hint` / `lastChainEvent` | 连锁相关（`chainCandidates` 为空表示"只能不连锁"） |
 | `selectMin` `selectMax` `selectCancelable` `selectableCount` | 选卡类约束 |
 | `canBp` `canEp` | 是否可进战阶/结束阶段 |
-| `places` `placesMask` | 放卡候选 `{i,ctrl,loc,seq,bit}` |
+| `places` `placesMask` | 放卡候选 `{i,ctrl,loc,seq,bit,ctrlRaw}`：**`ctrl` 为服务端座位**（`ctrlRaw` 是本地视角原值，调试用；响应字节仍用 `bit`） |
 | `sumTarget` `sumMode` `options` | 选素材/选项 |
 | `isFirst` `placeCoords` | 先/后手与放卡坐标约定（`server`/`local`） |
 

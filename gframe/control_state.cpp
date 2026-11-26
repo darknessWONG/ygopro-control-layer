@@ -90,6 +90,14 @@ std::string WideToUtf8(const wchar_t* w) {
 static std::string CardNameOf(unsigned code) { return WideToUtf8(dataManager.GetName(code)); }
 static std::string DescTextOf(int desc) { return desc > 0 ? WideToUtf8(dataManager.GetDesc(desc)) : std::string(); }
 
+// task-57: ClientCard/ChainInfo/place masks use the LOCAL perspective (0=me). The control API
+// exposes SERVER seats, so convert on output: 0 -> mySeat, 1 -> 1-mySeat (>=2 kept unchanged).
+int ToServerSeat(int localCtrl, int mySeat) {
+	if (localCtrl == 0) return mySeat;
+	if (localCtrl == 1) return 1 - mySeat;
+	return localCtrl;
+}
+
 /** minimal JSON string escaping (also used by control.cpp for /net, journal and resume) */
 std::string JsonEscape(const std::string& s) {
 	std::string o;
@@ -158,7 +166,7 @@ static void AppendChainJson(std::ostringstream& os, const Snapshot& s) {
 }
 
 
-void FillCard(std::vector<CardSnap>& out, ClientCard* c, int owner, int myPlayer) {
+void FillCard(std::vector<CardSnap>& out, ClientCard* c, int owner, int myPlayer, int mySeat) {
 	if (!c) return;
 	CardSnap s;
 	s.faceup = (c->position & POS_FACEUP) != 0;
@@ -169,8 +177,9 @@ void FillCard(std::vector<CardSnap>& out, ClientCard* c, int owner, int myPlayer
 	s.position = c->position;
 	s.location = c->location;
 	s.sequence = c->sequence;
-	s.ctrl = c->controler;
-	s.isMine = (owner == myPlayer); // dField is local-indexed: owner 0 == us
+	// task-57: output server seat; invariant isMine == (ctrl == mySeat)
+	s.ctrl = ToServerSeat(c->controler, mySeat);
+	s.isMine = (s.ctrl == mySeat);
 	if (!s.hidden) {
 		const CardDataC* cd = nullptr;
 		auto it = dataManager.GetCodePointer(c->code);
@@ -302,7 +311,9 @@ std::string PromptJson(const Snapshot& s) {
 	os << ",\"places\":[";
 	for (size_t i = 0; i < s.places.size(); ++i) {
 		if (i) os << ',';
-		os << "{\"i\":" << i << ",\"ctrl\":" << s.places[i].ctrl << ",\"loc\":" << s.places[i].loc
+		os << "{\"i\":" << i << ",\"ctrl\":" << ToServerSeat(s.places[i].ctrl, s.mySeat)
+		   << ",\"ctrlRaw\":" << s.places[i].ctrl // local view (0=me), for debugging
+		   << ",\"loc\":" << s.places[i].loc
 		   << ",\"seq\":" << s.places[i].seq << ",\"bit\":" << s.places[i].bit << '}';
 	}
 	os << "],\"placesMask\":" << s.selectableFieldMask
@@ -618,17 +629,17 @@ void SnapshotFromClient(Snapshot& s) {
 	                       // in practice but the ctrl/isMine comparison must use the real seat)
 	auto& f = mainGame->dField;
 	for (int i = 0; i < 2; ++i) {
-		for (auto* c : f.hand[i]) FillCard(s.hand[i], c, i, s.myPlayer);
-		for (auto* c : f.mzone[i]) FillCard(s.monsters[i], c, i, s.myPlayer);
-		for (auto* c : f.szone[i]) FillCard(s.spells[i], c, i, s.myPlayer);
+		for (auto* c : f.hand[i]) FillCard(s.hand[i], c, i, s.myPlayer, s.mySeat);
+		for (auto* c : f.mzone[i]) FillCard(s.monsters[i], c, i, s.myPlayer, s.mySeat);
+		for (auto* c : f.szone[i]) FillCard(s.spells[i], c, i, s.myPlayer, s.mySeat);
 		s.graveCount[i] = (int)f.grave[i].size();
 		s.removeCount[i] = (int)f.remove[i].size();
 		s.deckCount[i] = (int)f.deck[i].size();
 		s.extraCount[i] = (int)f.extra[i].size();
-		for (auto* c : f.grave[i]) FillCard(s.grave[i], c, i, s.myPlayer);
-		for (auto* c : f.remove[i]) FillCard(s.banished[i], c, i, s.myPlayer);
+		for (auto* c : f.grave[i]) FillCard(s.grave[i], c, i, s.myPlayer, s.mySeat);
+		for (auto* c : f.remove[i]) FillCard(s.banished[i], c, i, s.myPlayer, s.mySeat);
 		if (i == s.myPlayer) {
-			for (auto* c : f.extra[i]) FillCard(s.extraDeck, c, i, s.myPlayer);
+			for (auto* c : f.extra[i]) FillCard(s.extraDeck, c, i, s.myPlayer, s.mySeat);
 			// our own extra deck: the field pile has no codes until revealed, so use the loaded deck list
 			if (!g_sentExtra.empty()) {
 				s.extraDeck.clear();
@@ -640,6 +651,8 @@ void SnapshotFromClient(Snapshot& s) {
 					es.attack = 0;
 					es.defense = 0;
 					es.location = 0x40;
+					es.ctrl = s.mySeat; // task-57: own extra deck
+					es.isMine = true;
 					{
 						auto it2 = dataManager.GetCodePointer(code2);
 						if (it2 != dataManager.GetDataTable().end()) { es.type = it2->second.type; es.level = it2->second.level; es.attack = it2->second.attack; es.defense = it2->second.defense; }
@@ -660,14 +673,14 @@ void SnapshotFromClient(Snapshot& s) {
 	s.attackable = (int)f.attackable_cards.size();
 	for (auto* c : f.conti_cards) {
 		if (!c) continue;
-		CandSnap cs; cs.code = c->code; cs.ctrl = c->controler; cs.loc = c->location; cs.seq = c->sequence;
+		CandSnap cs; cs.code = c->code; cs.ctrl = ToServerSeat(c->controler, s.mySeat); cs.loc = c->location; cs.seq = c->sequence;
 		cs.desc = c->cHint;
 		{ const CardDataC* cd = dataManager.GetCodePointer(c->code) == dataManager.GetDataTable().end() ? nullptr : &dataManager.GetCodePointer(c->code)->second;
 		  if (cd) { if (!cs.level) cs.level = cd->level; if (!cs.type) cs.type = cd->type; } }
 		s.contiList.push_back(cs);
 	}
 	for (const auto& ch : f.chains) {
-		CandSnap cs; cs.code = ch.code; cs.desc = ch.desc; cs.ctrl = ch.controler; cs.loc = ch.location; cs.seq = ch.sequence; cs.forced = ch.solved;
+		CandSnap cs; cs.code = ch.code; cs.desc = ch.desc; cs.ctrl = ToServerSeat(ch.controler, s.mySeat); cs.loc = ch.location; cs.seq = ch.sequence; cs.forced = ch.solved;
 		s.chainStackSnap.push_back(cs);
 	}
 	s.chainForced = f.chain_forced;
@@ -698,8 +711,8 @@ void SnapshotFromClient(Snapshot& s) {
 		cs.level = pc->level;
 		cs.rank = pc->rank;
 		cs.type = pc->type;
-		cs.ctrl = pc->controler;
-		cs.isMine = (pc->controler == mySeatNow);
+		cs.ctrl = ToServerSeat(pc->controler, mySeatNow);
+		cs.isMine = (cs.ctrl == mySeatNow);
 		cs.name = CardNameOf(pc->code);
 		// hand / extra-deck cards often carry no data yet: fill type/level/atk/def from cards.cdb
 		if (cs.level == 0 || cs.type == 0) {
@@ -734,7 +747,7 @@ void SnapshotFromClient(Snapshot& s) {
 		if (!pc) continue;
 		CandSnap cs;
 		cs.code = pc->code;
-		cs.ctrl = pc->controler;
+		cs.ctrl = ToServerSeat(pc->controler, mySeatNow);
 		cs.loc = pc->location;
 		cs.seq = (int)i; // message order == response index
 		cs.seqNo = (unsigned)i;
@@ -772,10 +785,10 @@ void SnapshotFromClient(Snapshot& s) {
 			}
 			ls.descText = DescTextOf(ls.desc);
 			if (ls.descText.empty()) ls.descText = ls.name.empty() ? "（未知效果）" : (ls.name + " 的效果");
-			ls.ctrl = ch.controler;
+			ls.ctrl = ToServerSeat(ch.controler, s.mySeat);
 			ls.loc = ch.location;
 			ls.seq = ch.sequence;
-			ls.isMine = (ch.controler == mySeat);
+			ls.isMine = (ls.ctrl == s.mySeat);
 			ls.solved = ch.solved;
 			ls.summary = std::string(ls.isMine ? "我方" : "对手") + "[" + CardLabel(ls.code, ls.name) + "]" +
 				(ls.descText.empty() ? "" : "（" + ls.descText + "）") + " 已加入连锁";
@@ -801,8 +814,8 @@ void SnapshotFromClient(Snapshot& s) {
 			cs.descText = DescTextOf(cs.desc);
 			if (cs.descText.empty()) cs.descText = cs.name.empty() ? "（未知效果）" : (cs.name + " 的效果");
 			cs.forced = (i < f.activatable_descs.size()) && (f.activatable_descs[i].second & 0x100) != 0;
-			cs.isMine = (pc->controler == mySeat);
-			cs.ctrl = pc->controler;
+			cs.isMine = (cs.ctrl == mySeat);
+			cs.ctrl = ToServerSeat(pc->controler, mySeatNow);
 			cs.loc = pc->location;
 			cs.seq = pc->sequence;
 			cs.summary = std::string(cs.isMine ? "我方" : "对手") + "[" + CardLabel(cs.code, cs.name) + "]" +
