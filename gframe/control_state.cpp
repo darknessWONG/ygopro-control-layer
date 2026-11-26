@@ -674,6 +674,8 @@ void SnapshotFromClient(Snapshot& s) {
 	for (auto* c : f.conti_cards) {
 		if (!c) continue;
 		CandSnap cs; cs.code = c->code; cs.ctrl = ToServerSeat(c->controler, s.mySeat); cs.loc = c->location; cs.seq = c->sequence;
+		cs.isMine = (cs.ctrl == s.mySeat);
+		cs.name = CardNameOf(cs.code);
 		cs.desc = c->cHint;
 		{ const CardDataC* cd = dataManager.GetCodePointer(c->code) == dataManager.GetDataTable().end() ? nullptr : &dataManager.GetCodePointer(c->code)->second;
 		  if (cd) { if (!cs.level) cs.level = cd->level; if (!cs.type) cs.type = cd->type; } }
@@ -681,6 +683,8 @@ void SnapshotFromClient(Snapshot& s) {
 	}
 	for (const auto& ch : f.chains) {
 		CandSnap cs; cs.code = ch.code; cs.desc = ch.desc; cs.ctrl = ToServerSeat(ch.controler, s.mySeat); cs.loc = ch.location; cs.seq = ch.sequence; cs.forced = ch.solved;
+		cs.isMine = (cs.ctrl == s.mySeat);
+		cs.name = CardNameOf(cs.code);
 		s.chainStackSnap.push_back(cs);
 	}
 	s.chainForced = f.chain_forced;
@@ -748,6 +752,8 @@ void SnapshotFromClient(Snapshot& s) {
 		CandSnap cs;
 		cs.code = pc->code;
 		cs.ctrl = ToServerSeat(pc->controler, mySeatNow);
+		cs.isMine = (cs.ctrl == mySeatNow);
+		cs.name = CardNameOf(cs.code);
 		cs.loc = pc->location;
 		cs.seq = (int)i; // message order == response index
 		cs.seqNo = (unsigned)i;
@@ -814,8 +820,9 @@ void SnapshotFromClient(Snapshot& s) {
 			cs.descText = DescTextOf(cs.desc);
 			if (cs.descText.empty()) cs.descText = cs.name.empty() ? "（未知效果）" : (cs.name + " 的效果");
 			cs.forced = (i < f.activatable_descs.size()) && (f.activatable_descs[i].second & 0x100) != 0;
+			// task-57b: map ctrl FIRST, then derive isMine from the converted value
+			cs.ctrl = ToServerSeat(pc->controler, mySeat);
 			cs.isMine = (cs.ctrl == mySeat);
-			cs.ctrl = ToServerSeat(pc->controler, mySeatNow);
 			cs.loc = pc->location;
 			cs.seq = pc->sequence;
 			cs.summary = std::string(cs.isMine ? "我方" : "对手") + "[" + CardLabel(cs.code, cs.name) + "]" +
