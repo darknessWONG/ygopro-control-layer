@@ -84,6 +84,16 @@ void ApplyChainMode(const char* why) {
 	// m == 3 "normal": all three flags stay false (client cold-start default)
 	mainGame->dField.UpdateChainButtons();
 	g_appliedChainMode.store(m);
+	// task-58: refresh the cached snapshot immediately so /ui and /state report the new REAL mode
+	// even when the client is idle (guest receives no packets -> g_shared would stay stale).
+	{
+		std::lock_guard<std::mutex> lk(g_mutex);
+		g_shared.chainMode = m;
+		g_shared.alwaysChain = (m == 0);
+		g_shared.chainWhenAvail = (m == 1);
+		g_shared.ignoreChain = (m == 2);
+	}
+	g_snapshotWanted.store(true);
 	// Throttle the self-heal log to 1/s so a fighting client cannot flood control-<pid>.log
 	if (why && std::strcmp(why, "reassert") == 0 && GetTickCount64() - g_reassertLogTick.load() < 1000) {
 		return;
