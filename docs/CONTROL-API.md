@@ -381,17 +381,20 @@ curl.exe -s -X POST http://127.0.0.1:7788/net/probe
 
 切换连锁时点：`GET /ui?chain=all|avail|ignore|normal`（返回同一结构，下一帧生效；`applyPending` 为 true 表示还没落地）。
 
-**连锁时点 4 态**（`chainMode`）：
+**连锁时点 4 态**（`chainMode`，进入对局默认 = `normal`）：
 
-| 值 | 名称 | 含义 | 三个原始布尔 |
+| 值 | 名称 | 行为语义 | 三个原始布尔 |
 |---|---|---|---|
-| 0 | `all` | 全部时点 | `alwaysChain=true` |
-| 1 | `avail` | 可用时点 | `chainWhenAvail=true` |
-| 2 | `ignore` | 忽略时点 | `ignoreChain=true` |
-| 3 | `normal` | **全不按**（客户端冷启动默认，进入对局默认） | 三个全 `false` |
+| 0 | **all**（全部时点） | 任何时候都给窗口，**不管有没有可用动作** | `alwaysChain=true` |
+| 1 | **avail**（全部可用时点） | **只要有合法动作就询问**（all 之下，过滤掉完全无动作的时点） | `chainWhenAvail=true` |
+| 2 | **ignore**（无视所有时点） | 不弹可选窗口、自动放弃；**但不会无视部分诱发效果**（强制/必发类仍会处理） | `ignoreChain=true` |
+| 3 | **normal**（常用时点，**默认**） | **avail 的基础上再过滤掉一些非常用的询问**（只在 spec/select-trigger 类窗口询问） | 三个全 `false` |
 
-> `normal` 只在 `spec/select-trigger` 窗口询问（`count==0 || specount==0` 自动放弃）；`avail` 仅 `count==0` 才自动放弃。
-> `YGO_CHAIN_MODE` 默认 `normal`；人手动点三个按钮后会被 self-heal 恢复到 desired 模式。
+> 实现细节（客户端 `duelclient.cpp` 的 auto-decline 门）：`all` 永不自动放弃；`avail` 仅 `count==0` 放弃；
+> `normal` 在 `count==0 || specount==0` 放弃；`ignore` 无条件放弃（forced 强制类除外）。
+> `count`=本窗口可发动卡数；`specount`=其中 spec/常用触发计数（`0x7f` = select_trigger 窗口）。
+>
+> `YGO_CHAIN_MODE` 默认 `normal`；手动点了三个按钮后会被 self-heal 恢复到 desired 模式。
 
 ### 3.11 `GET /lobby`
 
@@ -538,7 +541,7 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 |---|---|---|
 | `YGO_CONTROL_PORT` | `7788` | HTTP 监听端口（本机双开时 7789） |
 | `YGO_HOOKS` | `all`（=7） | 钩子集合：`msg`/`analyze`/`stoc`，或 `msganalyze` 之类组合 |
-| `YGO_CHAIN_MODE` | `normal` | 连锁时点：`all` / `avail` / `ignore` / `normal`（全不按，默认；进入对局自动应用） |
+| `YGO_CHAIN_MODE` | `normal` | 连锁时点：`all`（全部）/ `avail`（全部可用）/ `ignore`（无视所有时点）/ `normal`（常用时点，默认；进入对局自动应用） |
 | `YGO_TP` | 未设 | 强制先/后攻：`1`=先攻、`2`=后攻（覆盖 LLM 选择与手动默认） |
 | `YGO_RPS` | 随机 | 猜拳结果：`1/2/3`（石头/剪刀/布） |
 | `YGO_UI_ACTIONS` | `1` | 是否用真实 UI 注入执行动作（`0`=全部直发协议） |
