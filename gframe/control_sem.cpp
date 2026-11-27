@@ -381,7 +381,10 @@ std::string SemActionsJson(const Snapshot& s) {
 	os << "{\"seq\":" << g_seq << ",\"curMsg\":" << s.curMsg << ",\"awaiting\":" << (g_awaiting ? "true" : "false") << ",\"actions\":[";
 	for (size_t i = 0; i < acts.size(); ++i) {
 		if (i) os << ',';
-		os << "{\"id\":" << i << ",\"kind\":\"" << acts[i].kind << "\",\"label\":\"";
+		// task-63: expose the semantic index too (POS value / candidate index / command index).
+		// Self-describing /actions: callers need not dig into docs to know what to submit.
+		os << "{\"id\":" << i << ",\"kind\":\"" << acts[i].kind << "\",\"index\":" << acts[i].index
+		   << ",\"label\":\"";
 		for (size_t k = 0; k < acts[i].label.size(); ++k) {
 			char ch = acts[i].label[k];
 			if (ch == '"' || ch == '\\') os << '\\' << ch;

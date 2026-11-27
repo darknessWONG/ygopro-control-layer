@@ -168,13 +168,16 @@ curl.exe -s "http://127.0.0.1:7788/wait_prompt?since=12&timeout_ms=30000"
 
 ```json
 {"seq":42,"curMsg":11,"awaiting":true,"actions":[
-  {"id":0,"kind":"summon","label":"summon #0 code=22835145 lv=2 tuner"},
-  {"id":1,"kind":"set_monster","label":"set monster #0 code=22835145"},
-  {"id":2,"kind":"activate","label":"activate #0 code=5318639"},
-  {"id":3,"kind":"to_bp","label":"go to battle phase"},
-  {"id":4,"kind":"to_ep","label":"end phase"}
+  {"id":0,"kind":"summon","index":0,"label":"summon #0 code=22835145 lv=2 tuner"},
+  {"id":1,"kind":"set_monster","index":0,"label":"set monster #0 code=22835145"},
+  {"id":2,"kind":"activate","index":0,"label":"activate #0 code=5318639"},
+  {"id":3,"kind":"to_bp","index":0,"label":"go to battle phase"},
+  {"id":4,"kind":"to_ep","index":0,"label":"end phase"}
 ]}
 ```
+
+每条动作含 `id`（提交用）、`kind`、**`index`**（语义下标：POS 值 / 候选下标 / 命令下标等；`0` 也照常输出）、`label`（人读）。
+`position` 动作的 `index` 即 `POS_*` 位值（`1/2/4/8`），`select_card` 的 `index` 是候选列表下标。
 
 - `awaiting:false` 时返回 `{"actions":[],"awaiting":false,...,"reason":"not awaiting"}`；
 - **选卡/攻击目标**（`MSG_SELECT_CARD/TRIBUTE/UNSELECT_CARD`）：
