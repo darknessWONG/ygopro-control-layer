@@ -600,9 +600,16 @@ int LaunchSeat() {
 }
 
 int SelfSeat() {
+	// task-59: inside a duel, dInfo.isFirst is authoritative: the client sets it from MSG_START's
+	// playertype byte, and isFirst == true <=> our SERVER seat is 0. MC ranked does not always send
+	// STOC_TYPE_CHANGE (selftype stays 0 for the guest), and the MC launcher uses -d/-k so
+	// LaunchSeat's -c/-j fallback fails -> the old code returned 0 for the guest.
+	if (mainGame && (mainGame->dInfo.isInDuel || mainGame->dInfo.isStarted)) {
+		return mainGame->dInfo.isFirst ? 0 : 1;
+	}
 	const int s = (int)(DuelClient::selftype & 1);
 	const int l = LaunchSeat();
-	if (l >= 0 && s == 0 && l == 1) return 1; // guest: server has not sent our seat yet
+	if (l >= 0 && s == 0 && l == 1) return 1; // lobby: server has not sent our seat yet
 	return s;
 }
 void SnapshotFromClient(Snapshot& s) {

@@ -63,6 +63,10 @@ YGOPro.exe
 > 对外 `ctrl` 一律是**服务端座位**，且恒有 `isMine == (ctrl == mySeat)`。双方都是 guest 时
 > `mySeat=1`，此时自己的卡 `ctrl=1/isMine=true`、对手的卡 `ctrl=0/isMine=false`。
 > 需要看本地视角原值时用 `ctrlRaw`（仅 `places[]` 输出）。
+>
+> `mySeat` 的来源：**对局/换备期间以 `dInfo.isFirst` 为准**（`isFirst==true` ⟺ 服务端座位 0；
+> 由 `MSG_START` 的 playertype 推导，MC 排位不一定发 `STOC_TYPE_CHANGE`）；大厅/未开局时才退回
+> `selftype` + 启动参数（`-c/-j`）。`MSG_START` 后会打日志 `SEAT resolved seat=.. isFirst=.. selftype=.. launch=..`。
 
 ---
 

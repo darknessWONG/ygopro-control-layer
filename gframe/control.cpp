@@ -2485,6 +2485,11 @@ void Control::OnAnalyzeEnd() {
 	++g_analyzeCount;
 	g_lastAnalyzeTick.store(now);
 	MaybePeriodicPipelineLog();
+	// task-59: log the resolved seat right after MSG_START (dInfo.isFirst is set by the handler)
+	if (g_lastMsgId == MSG_START && mainGame) {
+		Control::Log("SEAT resolved seat=%d isFirst=%d selftype=%d launch=%d",
+			ctl::SelfSeat(), mainGame->dInfo.isFirst ? 1 : 0, (int)DuelClient::selftype, ctl::LaunchSeat());
+	}
 	// task-28i/k: a prompt message that the client itself answered during ClientAnalyze is already
 	// handled -> publishing it would make the policy send a duplicate response.  Two detectors:
 	//   1) CTOS count grew (SendResponse() now also notifies OnCtosPacket)
