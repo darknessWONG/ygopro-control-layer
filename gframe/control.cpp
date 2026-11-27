@@ -570,6 +570,9 @@ std::atomic<long long> g_tpDeadlineMs{ 0 }; // task-48: auto-answer TP if no ext
 // task-35: Bo3 side decking (see control_internal.h)
 std::atomic<bool> g_sidePending{ false };
 std::atomic<bool> g_sidePromptActive{ false };
+// task-60: true once /side_swap actually moved cards in the current siding window (counts stay
+// equal after a legal swap, so mismatch alone cannot tell "changed" from "untouched").
+std::atomic<bool> g_sideDirty{ false };
 std::atomic<int> g_matchGame{ 0 }; // task-35f: count of STOC_DUEL_START (Bo3 games)
 // task-36: side-decking waiting state
 std::atomic<bool> g_sideWaiting{ false };
@@ -1296,6 +1299,7 @@ void OnChangeSideImpl() {
 	// task-36: a new siding window resets the sticky waiting diagnostics
 	g_sideWaitingSeen.store(false);
 	g_sideLastWaitMs.store(0);
+	g_sideDirty.store(false); // task-60: fresh window -> "no changes" until a swap succeeds
 	if (!g_controlDriven.load()) return; // manual play keeps the original siding UI
 	g_sidePending.store(true);
 	g_sideWaiting.store(false);
@@ -1484,10 +1488,17 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 					g_shared.side.extraCount != g_shared.side.preExtra ||
 					g_shared.side.sideCount != g_shared.side.preSide);
 				std::ostringstream oss;
+				// task-60: three-state label. NOTE counts stay EQUAL after a legal swap, so the
+				// "changed" state comes from g_sideDirty, not from the count comparison.
+				const char* okLabel =
+					mismatch ? "counts mismatch: fix main/extra/side counts before confirming"
+					: (g_sideDirty.load() ? "confirm side deck (changed) and continue"
+					                      : "keep side deck (no changes) and continue");
 				oss << "{\"actions\":[{\"id\":0,\"kind\":\"side_ok\","
-				    << "\"label\":\"keep side deck (no changes) and continue\"}],"
+				    << "\"label\":\"" << okLabel << "\"}],"
 				    << "\"awaiting\":true,\"sidePending\":true,\"curMsg\":" << g_promptSnap.curMsg
 				    << ",\"seq\":" << (unsigned long long)g_seq
+				    << ",\"changed\":" << (g_sideDirty.load() ? "true" : "false")
 				    << ",\"counts\":{\"main\":" << g_shared.side.mainCount
 				    << ",\"extra\":" << g_shared.side.extraCount
 				    << ",\"side\":" << g_shared.side.sideCount << '}'
@@ -1883,6 +1894,7 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 				a.deckName = from + ">" + to;
 				g_actions.push_back(std::move(a));
 			}
+			g_sideDirty.store(true); // task-60: label/changed must reflect the swap
 			body = "{\"ok\":true,\"queued\":true,\"main\":" + std::to_string(m) +
 				",\"extra\":" + std::to_string(e) + ",\"side\":" + std::to_string(s) + "}";
 		} else if (path == "/hostopts") {

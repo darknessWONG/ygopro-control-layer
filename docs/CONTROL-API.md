@@ -225,11 +225,19 @@ Bo3 的 `Game1 → Game2` 之间服务端会发 `STOC_CHANGE_SIDE`（进 siding 
 控制层被 HTTP 驱动时：
 
 - `/state.sidePending:true`；`/prompt` 出现 `sidePending:true`（`seq++`，与普通 prompt 一样冻结）；
-- `/actions` 返回一条：
+- `/actions` 返回一条（**label 三态 + `changed`**）：
   ```json
   {"actions":[{"id":0,"kind":"side_ok","label":"keep side deck (no changes) and continue"}],
-   "awaiting":true,"sidePending":true}
+   "awaiting":true,"sidePending":true,"changed":false,
+   "counts":{"main":40,"extra":15,"side":15},"sideError":null}
   ```
+  - **`changed`**：本轮换备窗口内是否真的调用过 `/side_swap`（`false`=没换，`true`=换过）。
+    **张数相等 ≠ 没换牌**（合法互换后 main/extra/side 仍然守恒），所以判断"是否换过"请读 `changed`，不要只看 `counts`。
+  - label 三态：
+    1. `keep side deck (no changes) and continue`（初始，`changed:false`）
+    2. `confirm side deck (changed) and continue`（`/side_swap` 成功后，`changed:true`）
+    3. `counts mismatch: fix main/extra/side counts before confirming`（张数不守恒，`sideError:"counts must match"`，此时 `side_ok` 会被拒绝）
+  - 进入下一局/新的 `STOC_CHANGE_SIDE` 窗口时 `changed` 复位为 `false`。
 - `/act_id?id=0` → 在 UI 线程点击真实 `btnSideOK`（客户端自己的 `BUTTON_SIDE_OK` handler：校验
   main/extra/side 数量不变 → `SendUpdateDeck`），日志 `SIDE ok clicked (from control)`；
   随后服务端 `STOC_WAITING_SIDE`（等对手）会清掉 pending，下一局重新 `/ready` 即可。
