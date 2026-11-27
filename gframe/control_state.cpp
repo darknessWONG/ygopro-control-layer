@@ -915,7 +915,7 @@ void SnapshotFromClient(Snapshot& s) {
 		// UI / chain-mode snapshot (read on the UI thread, so no extra locking needed here)
 		// chainMode is derived from the REAL booleans (the client may have overwritten them at
 		// duel start); desired/applied are reported separately by UiJson().
-		s.chainMode = mainGame->always_chain ? 0 : (mainGame->ignore_chain ? 2 : 1);
+		s.chainMode = mainGame->always_chain ? 0 : (mainGame->ignore_chain ? 2 : (mainGame->chain_when_avail ? 1 : 3));
 		s.alwaysChain = mainGame->always_chain;
 		s.chainWhenAvail = mainGame->chain_when_avail;
 		s.ignoreChain = mainGame->ignore_chain;

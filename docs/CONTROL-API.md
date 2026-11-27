@@ -119,7 +119,7 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
                    {"game":2,"win":true,"winnerSeat":0,"reason":4,"reasonName":"DISCONNECT"}],
           "gamesWonLocal":2,"gamesWonOpp":0,
           "lastWinnerLocal":true,"lastReasonName":"DISCONNECT"},
- "chainMode":1,"seq":5,"awaiting":true,
+ "chainMode":3,"seq":5,"awaiting":true,
  "counts":{"hand":[5,5],"grave":[0,1],"remove":[0,0],"deck":[35,34],"extra":[15,15]},
  "chainDepth":0,"chainStack":[],"chainingTo":null,"chainCandidates":[],"canDecline":true,
  "pipeline":{"analyzeCount":42,"pumpCount":900,"msgCount":40,"seq":5,"awaiting":true,
@@ -370,8 +370,8 @@ curl.exe -s -X POST http://127.0.0.1:7788/net/probe
 返回 UI 状态（连锁时点 + 弹窗 + 窗口诊断）：
 
 ```json
-{"chainMode":1,"chainModeName":"avail","alwaysChain":false,"chainWhenAvail":true,
- "ignoreChain":false,"desiredChainMode":1,"appliedChainMode":1,"applyPending":false,
+{"chainMode":3,"chainModeName":"normal","alwaysChain":false,"chainWhenAvail":false,
+ "ignoreChain":false,"desiredChainMode":3,"appliedChainMode":3,"applyPending":false,
  "popupMask":0,"popups":{"posSelect":false,"options":false,"cardSelect":false,
  "cmdMenu":false,"message":false},
  "windowsVisible":["wChat"],
@@ -379,7 +379,19 @@ curl.exe -s -X POST http://127.0.0.1:7788/net/probe
              "x":821,"y":335,"w":350,"h":140,"textLen":0}]}
 ```
 
-切换连锁时点：`GET /ui?chain=all|avail|ignore`（返回同一结构，下一帧生效；`applyPending` 为 true 表示还没落地）。
+切换连锁时点：`GET /ui?chain=all|avail|ignore|normal`（返回同一结构，下一帧生效；`applyPending` 为 true 表示还没落地）。
+
+**连锁时点 4 态**（`chainMode`）：
+
+| 值 | 名称 | 含义 | 三个原始布尔 |
+|---|---|---|---|
+| 0 | `all` | 全部时点 | `alwaysChain=true` |
+| 1 | `avail` | 可用时点 | `chainWhenAvail=true` |
+| 2 | `ignore` | 忽略时点 | `ignoreChain=true` |
+| 3 | `normal` | **全不按**（客户端冷启动默认，进入对局默认） | 三个全 `false` |
+
+> `normal` 只在 `spec/select-trigger` 窗口询问（`count==0 || specount==0` 自动放弃）；`avail` 仅 `count==0` 才自动放弃。
+> `YGO_CHAIN_MODE` 默认 `normal`；人手动点三个按钮后会被 self-heal 恢复到 desired 模式。
 
 ### 3.11 `GET /lobby`
 
@@ -526,7 +538,7 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 |---|---|---|
 | `YGO_CONTROL_PORT` | `7788` | HTTP 监听端口（本机双开时 7789） |
 | `YGO_HOOKS` | `all`（=7） | 钩子集合：`msg`/`analyze`/`stoc`，或 `msganalyze` 之类组合 |
-| `YGO_CHAIN_MODE` | `avail` | 连锁时点：`all` / `avail` / `ignore` |
+| `YGO_CHAIN_MODE` | `normal` | 连锁时点：`all` / `avail` / `ignore` / `normal`（全不按，默认；进入对局自动应用） |
 | `YGO_TP` | 未设 | 强制先/后攻：`1`=先攻、`2`=后攻（覆盖 LLM 选择与手动默认） |
 | `YGO_RPS` | 随机 | 猜拳结果：`1/2/3`（石头/剪刀/布） |
 | `YGO_UI_ACTIONS` | `1` | 是否用真实 UI 注入执行动作（`0`=全部直发协议） |

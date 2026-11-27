@@ -63,7 +63,13 @@ namespace ygo {
 namespace ctl {
 
 const char* ChainModeName(int m) {
-	return m == 0 ? "all" : (m == 2 ? "ignore" : "avail");
+	switch (m) {
+	case 0: return "all";
+	case 1: return "avail";
+	case 2: return "ignore";
+	case 3: return "normal"; // all three booleans false (client cold-start default)
+	default: return "normal";
+	}
 }
 
 /**
@@ -75,6 +81,7 @@ void ApplyChainMode(const char* why) {
 	mainGame->always_chain = (m == 0);
 	mainGame->chain_when_avail = (m == 1);
 	mainGame->ignore_chain = (m == 2);
+	// m == 3 "normal": all three flags stay false (client cold-start default)
 	mainGame->dField.UpdateChainButtons();
 	g_appliedChainMode.store(m);
 	// Throttle the self-heal log to 1/s so a fighting client cannot flood control-<pid>.log

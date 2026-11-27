@@ -201,19 +201,19 @@ bool g_placeCoordsServer{ true };             // env YGO_PLACE_COORDS=local (raw
 // The server answers MSG_RETRY when the encoding is not accepted, so OnMessageBegin() bumps
 // this on every place retry; first accepted variant is then kept until the next place prompt.
 std::atomic<int> g_placeVariant{ 0 };
-// Chain-check mode (the "时点" setting): 0=all(全部), 1=avail(可用), 2=ignore(忽略).
-// The client defaults to "all" from dInfo/gameConf; we force it to avail at duel start.
-std::atomic<int> g_chainMode{ 1 };          // desired mode (env YGO_CHAIN_MODE, default avail)
-std::atomic<int> g_appliedChainMode{ 1 };   // last mode actually pushed into the client
+// Chain-check mode (the "时点" setting): 0=all(全部), 1=avail(可用), 2=ignore(忽略),
+// 3=normal(全不按, client cold-start default — the three booleans are all false).
+std::atomic<int> g_chainMode{ 3 };          // desired mode (env YGO_CHAIN_MODE, default normal)
+std::atomic<int> g_appliedChainMode{ 3 };   // last mode actually pushed into the client
 std::atomic<bool> g_applyChainPending{ true }; // Pump() should call ApplyChainMode()
 std::atomic<unsigned> g_uiCleanupCount{ 0 };
 std::atomic<unsigned> g_popupBits{ 0 };       // cached popup mask, written by Pump (UI thread), read by HTTP
 // REAL chain-check state (cached from the widgets by Pump every frame; HTTP only reads these,
 // never mainGame->always_chain directly) + throttling for the self-heal log.
 std::atomic<bool> g_realAlways{ false };
-std::atomic<bool> g_realAvail{ true };
+std::atomic<bool> g_realAvail{ false };
 std::atomic<bool> g_realIgnore{ false };
-std::atomic<int> g_realChainMode{ 1 };
+std::atomic<int> g_realChainMode{ 3 };
 std::atomic<uint64_t> g_reassertLogTick{ 0 };
 // task-19: last CHAINING/CHAINED and HINT seen on the network thread; readable text is built on
 // the UI thread (dataManager lookups happen there in SnapshotFromClient).
@@ -1426,7 +1426,7 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 			body = SnapshotJson(g_shared);
 		} else if (path == "/ui") {
 			// GET /ui            -> current chain mode + popup visibility
-			// GET /ui?chain=all|avail|ignore -> switch immediately (applied on the next Pump frame)
+			// GET /ui?chain=all|avail|ignore|normal -> switch immediately (applied on the next Pump frame)
 			const std::string chain = QueryParam(query, "chain");
 			std::string err;
 			if (!chain.empty()) {
@@ -1434,7 +1434,8 @@ std::string RouteRequest(const std::string& path, const std::string& query, std:
 				if (chain == "all") m = 0;
 				else if (chain == "avail") m = 1;
 				else if (chain == "ignore") m = 2;
-				if (m < 0) err = "bad chain mode (all|avail|ignore)";
+				else if (chain == "normal") m = 3;
+				if (m < 0) err = "bad chain mode (all|avail|ignore|normal)";
 				else {
 					g_chainMode.store(m);
 					g_applyChainPending.store(true);
@@ -2002,7 +2003,8 @@ void Control::EnsureStarted() {
 		}
 		if (const char* cm = std::getenv("YGO_CHAIN_MODE")) {
 			const std::string m(cm);
-			g_chainMode.store(m == "all" ? 0 : (m == "ignore" ? 2 : 1));
+			// 4 states: all | avail | ignore | normal (default normal = all three booleans false)
+			g_chainMode.store(m == "all" ? 0 : (m == "ignore" ? 2 : (m == "avail" ? 1 : 3)));
 		}
 		if (const char* ua = std::getenv("YGO_UI_ACTIONS")) {
 			// experimental switch: default OFF until the UI-click path passes smoke tests
@@ -2948,7 +2950,7 @@ void Control::Pump() {
 	g_realAlways.store(mainGame->always_chain);
 	g_realAvail.store(mainGame->chain_when_avail);
 	g_realIgnore.store(mainGame->ignore_chain);
-	g_realChainMode.store(mainGame->always_chain ? 0 : (mainGame->ignore_chain ? 2 : 1));
+	g_realChainMode.store(mainGame->always_chain ? 0 : (mainGame->ignore_chain ? 2 : (mainGame->chain_when_avail ? 1 : 3)));
 	g_popupBits.store(PopupBits()); // cached for /ui (HTTP thread must not touch widgets)
 	CtlDbg("Pump leave");
 }
