@@ -151,6 +151,7 @@ curl.exe -s http://127.0.0.1:7788/state | findstr /C:"\"turn\":" /C:"\"lp\":" /C
 | `summonableCards` `spsummonableCards` `msetableCards` `ssetableCards` `activatableCards` `attackableCards` `selectableCards` `chains` | 候选卡数组，元素 `{i,code,atk,def,loc,seq,seqNo,resp,position,op,lv,rk,ty,desc,ctrl,isMine,name,forced}`；**响应字节用 `seqNo`/`resp`（=select_seq），不是列表下标 `i`**；`ctrl` 为服务端座位且 `isMine == (ctrl == mySeat)` |
 | `chains` / `chainDepth` / `chainStack` / `chainingTo` / `chainCandidates` / `canDecline` / `hint` / `lastChainEvent` | 连锁相关（`chainCandidates` 为空表示"只能不连锁"） |
 | `selectMin` `selectMax` `selectCancelable` `selectableCount` | 选卡类约束 |
+| `selectablePositions` `selectablePositionsHex` | **仅 `MSG_SELECT_POSITION(19)` 时**：合法表示形式掩码（`POS_*` 位值）。`0x1`=表侧攻击、`0x2`=里侧攻击（set）、`0x4`=表侧守备、`0x8`=里侧守备（set）；`/actions` 只列出掩码内的项；掩码 0（未捕获）时回退表攻/表守两条 |
 | `canBp` `canEp` | 是否可进战阶/结束阶段 |
 | `places` `placesMask` | 放卡候选 `{i,ctrl,loc,seq,bit,ctrlRaw}`：**`ctrl` 为服务端座位**（`ctrlRaw` 是本地视角原值，调试用；响应字节仍用 `bit`） |
 | `sumTarget` `sumMode` `options` | 选素材/选项 |
@@ -450,7 +451,7 @@ curl.exe -s -X POST http://127.0.0.1:7788/net/probe
 | | `decline` | `i = -1` |
 | 是否（`MSG_SELECT_YESNO`=13 / `EFFECTYN`=12） | `yes` / `no` | `1` / `0` |
 | 选项（`MSG_SELECT_OPTION`=14） | `option` | `i = index` |
-| 表示形式（`MSG_SELECT_POSITION`=19） | `position` | `i & 0xff`：`1`=攻击表示，`2`=守备表示 |
+| 表示形式（`MSG_SELECT_POSITION`=19） | `position` | `i & 0xff` 为 `POS_*` 位值：`1`=表侧攻击、`2`=里侧攻击（set）、`4`=表侧守备、`8`=里侧守备（set）；只应选 `/prompt.selectablePositions` 掩码内的值；掩码只有单位值时客户端通常自动应答、不出现窗口 |
 | 放卡（`MSG_SELECT_PLACE`=18 / `DISFIELD`=24） | `place` | 原始字节 `[p, loc, seq]`；客户端按 `placeVariant` 轮换 4 种坐标约定（收到 `MSG_RETRY` 自动换下一种） |
 | 选卡（`MSG_SELECT_CARD`=15 / `TRIBUTE`=20 / `UNSELECT_CARD`=26） | `select` | 字节 `[n, seqNo...]`（默认选前 `selectMin` 张） |
 | 选素材（`MSG_SELECT_SUM`=23） | `sum` | 字节 `[n, seqNo...]`，按 `opParam` 贪心凑 `sumTarget` |
@@ -554,6 +555,7 @@ curl.exe -s -X POST "http://127.0.0.1:7788/act_id?id=1"
 | `YGO_CONTROL_PORT` | `7788` | HTTP 监听端口（本机双开时 7789） |
 | `YGO_HOOKS` | `all`（=7） | 钩子集合：`msg`/`analyze`/`stoc`，或 `msganalyze` 之类组合 |
 | `YGO_CHAIN_MODE` | `normal` | 连锁时点：`all`（全部）/ `avail`（全部可用）/ `ignore`（无视所有时点）/ `normal`（常用时点，默认；进入对局自动应用） |
+| `YGO_CHAIN_IGNORE_KEEP_OWN` | `1` | `ignore` 模式下若本窗口有**我方**可发动卡，则不自动放弃、正常弹 prompt（`1`=保留，默认；`0`=旧行为无条件放弃）。日志 `CHAIN client auto-decline ... ownCand=.. ignoreDecline=.. keepOwn=..` |
 | `YGO_TP` | 未设 | 强制先/后攻：`1`=先攻、`2`=后攻（覆盖 LLM 选择与手动默认） |
 | `YGO_RPS` | 随机 | 猜拳结果：`1/2/3`（石头/剪刀/布） |
 | `YGO_UI_ACTIONS` | `1` | 是否用真实 UI 注入执行动作（`0`=全部直发协议） |

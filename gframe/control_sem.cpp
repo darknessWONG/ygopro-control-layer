@@ -139,10 +139,20 @@ std::vector<SemAction> BuildSemActions(const Snapshot& s) {
 		}
 		break;
 	}
-	case MSG_SELECT_POSITION:
-		AddSem(v, "position", "attack position", 0x01, 0, 0, 0, 1);
-		AddSem(v, "position", "defense position", 0x02, 0, 0, 0, 1);
+	case MSG_SELECT_POSITION: {
+		// task-61: only the positions the server actually allows (POS_* bits). The old hard-coded
+		// defense=0x02 was face-down ATK and got rejected when the legal mask was 0x1|0x4.
+		const unsigned pos = s.selectablePositions;
+		if (pos & 0x1) AddSem(v, "position", "attack position (face-up ATK)", 0x01, 0, 0, 0, 1);
+		if (pos & 0x2) AddSem(v, "position", "attack position (face-down ATK / set)", 0x02, 0, 0, 0, 1);
+		if (pos & 0x4) AddSem(v, "position", "defense position (face-up DEF)", 0x04, 0, 0, 0, 1);
+		if (pos & 0x8) AddSem(v, "position", "defense position (face-down DEF / set)", 0x08, 0, 0, 0, 1);
+		if (!(pos & 0xf)) { // mask not captured -> conservative fallback
+			AddSem(v, "position", "attack position", 0x01, 0, 0, 0, 1);
+			AddSem(v, "position", "defense position", 0x04, 0, 0, 0, 1);
+		}
 		break;
+	}
 	case MSG_SELECT_PLACE:
 	case MSG_SELECT_DISFIELD: {
 		int i = 0;
@@ -239,6 +249,13 @@ bool EncodeSemAction(const Snapshot& s, const SemAction& a, int32_t& outI, std::
 		return true;
 	case MSG_SELECT_POSITION:
 		if (a.kind != "position") { err = "unknown position action"; return false; }
+		// task-61: reject values outside the legal POS_* mask (prevents illegal responses)
+		if (s.selectablePositions & 0xf) {
+			if ((a.index & 0xf) == 0 || ((unsigned)(a.index & 0xf) & s.selectablePositions) == 0) {
+				err = "position not allowed by selectablePositions mask";
+				return false;
+			}
+		}
 		outI = a.index & 0xff;
 		return true;
 	case MSG_SELECT_PLACE:

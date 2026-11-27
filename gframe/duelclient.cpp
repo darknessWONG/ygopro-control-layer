@@ -1883,16 +1883,26 @@ bool DuelClient::ClientAnalyze(unsigned char* msg, size_t len) {
 					panelmode = true;
 			}
 		}
-		if(!select_trigger && !mainGame->dField.chain_forced && (mainGame->ignore_chain || ((count == 0 || specount == 0) && !mainGame->always_chain)) && (count == 0 || !mainGame->chain_when_avail)) {
+		// task-62: ignore mode must not swallow OUR OWN trigger windows: if this window offers any
+		// card we control, publish it instead of auto-declining. YGO_CHAIN_IGNORE_KEEP_OWN=0 restores
+		// the old unconditional behaviour.
+		bool ownCand = false;
+		for (auto* pc : mainGame->dField.activatable_cards)
+			if (pc && pc->controler == 0) { ownCand = true; break; }
+		const char* keepEnv = std::getenv("YGO_CHAIN_IGNORE_KEEP_OWN");
+		const bool keepOwn = !(keepEnv && std::atoi(keepEnv) == 0);
+		const bool ignoreDecline = mainGame->ignore_chain && !(keepOwn && ownCand);
+		if(!select_trigger && !mainGame->dField.chain_forced && (ignoreDecline || ((count == 0 || specount == 0) && !mainGame->always_chain)) && (count == 0 || !mainGame->chain_when_avail)) {
 			static uint64_t lastAutoDeclineTick = 0;
 			static int autoDeclineBurst = 0;
 			const uint64_t nowTick = GetTickCount64();
 			const uint64_t gap = lastAutoDeclineTick ? (nowTick - lastAutoDeclineTick) : 0;
 			autoDeclineBurst = (gap && gap < 1000) ? (autoDeclineBurst + 1) : 1;
 			lastAutoDeclineTick = nowTick;
-			Control::Log("CHAIN client auto-decline count=%d specount=%d always=%d ignore=%d avail=%d gapMs=%llu burst=%d",
+			Control::Log("CHAIN client auto-decline count=%d specount=%d always=%d ignore=%d avail=%d ownCand=%d ignoreDecline=%d keepOwn=%d gapMs=%llu burst=%d",
 				count, specount, (int)mainGame->always_chain, (int)mainGame->ignore_chain,
-				(int)mainGame->chain_when_avail, (unsigned long long)gap, autoDeclineBurst);
+				(int)mainGame->chain_when_avail, ownCand ? 1 : 0, ignoreDecline ? 1 : 0,
+				keepOwn ? 1 : 0, (unsigned long long)gap, autoDeclineBurst);
 			SetResponseI(-1);
 			mainGame->dField.ClearChainSelect();
 			if(mainGame->chkWaitChain->isChecked() && !mainGame->ignore_chain) {

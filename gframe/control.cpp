@@ -590,6 +590,7 @@ std::atomic<uint64_t> g_ctosResponseCount{ 0 };
 std::atomic<uint64_t> g_ctosRespAtMsgBegin{ 0 };
 std::atomic<int> g_lastChainRawCount{ 0 };
 std::atomic<int> g_lastChainRawSpecount{ 0 };
+std::atomic<unsigned> g_selectablePositions{ 0 }; // task-61: MSG_SELECT_POSITION legal POS_* mask
 ChainCandRaw g_chainAnalyzeCands[64];
 
 void CaptureChainAnalyze() {
@@ -2372,6 +2373,16 @@ void Control::OnMessageBegin(const unsigned char* msg, size_t len) {
 		Control::Log("CHAIN raw selecting=%d count=%d specount=%d len=%zu",
 			(int)msg[1], (int)msg[2], (int)msg[3], len);
 	}
+	// task-61: MSG_SELECT_POSITION payload: [0]=selecting_player, [1..4]=code, [5]=positions
+	// (msg[0] is the msgId, so the payload mask is msg[6]); exact list otherwise undefined.
+	if (msgId == MSG_SELECT_POSITION) {
+		if (len >= 7) {
+			g_selectablePositions.store((unsigned)msg[6]);
+			Control::Log("POSITION prompt mask=0x%02x", (unsigned)msg[6]);
+		}
+	} else {
+		g_selectablePositions.store(0);
+	}
 	// task-28c: keep the recent message-id trail (visible in /state.pipeline.recentMsgs) so ranked
 	// stalls can be diagnosed without guessing which MSG ids the server actually sent us.
 	{
@@ -2624,7 +2635,14 @@ static void PromptIdlePump(uint64_t now) {
 	case MSG_SELECT_UNSELECT_CARD: ai = pickKind("select_auto", -1); if (ai < 0) ai = pickKind("select", -1); break;
 	case MSG_SELECT_PLACE:
 	case MSG_SELECT_DISFIELD: ai = pickKind("place", -1); break;
-	case MSG_SELECT_POSITION: ai = pickKind("position", 0x01); break;
+	case MSG_SELECT_POSITION:
+		// task-61: pick the first LEGAL position (face-up ATK, then face-up DEF, then others)
+		ai = pickKind("position", 0x01);
+		if (ai < 0) ai = pickKind("position", 0x04);
+		if (ai < 0) ai = pickKind("position", 0x02);
+		if (ai < 0) ai = pickKind("position", 0x08);
+		if (ai < 0) ai = pickKind("position", -1);
+		break;
 	case MSG_SORT_CARD: ai = pickKind("sort", -1); break;
 	case MSG_ANNOUNCE_RACE: ai = pickKind("announce_race", -1); break;
 	case MSG_ANNOUNCE_ATTRIB: ai = pickKind("announce_attrib", -1); break;

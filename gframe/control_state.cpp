@@ -279,6 +279,10 @@ std::string PromptJson(const Snapshot& s) {
 	   << ",\"lastChain\":" << (s.lastChain ? "true" : "false")
 	   << ",\"selectMin\":" << s.selectMin
 	   << ",\"selectMax\":" << s.selectMax
+	   // task-61: legal POS_* mask for MSG_SELECT_POSITION (0x1 face-up ATK, 0x2 face-down ATK,
+	   // 0x4 face-up DEF, 0x8 face-down DEF); response value must be one of these bits.
+	   << ",\"selectablePositions\":" << s.selectablePositions
+	   << ",\"selectablePositionsHex\":\"0x" << std::hex << s.selectablePositions << std::dec << '"'
 	   // task-53: battle target window marker (MSG_SELECT_CARD, single target, battle phase)
 	   << ",\"isAttackTarget\":" << ((s.curMsg == MSG_SELECT_CARD && s.selectMax == 1 && (s.phase & PHASE_BATTLE)) ? "true" : "false")
 	   // task-50: only present for MSG_ANNOUNCE_NUMBER (LLM picks one value)
@@ -700,6 +704,7 @@ void SnapshotFromClient(Snapshot& s) {
 	s.canEp = mainGame->btnEP && mainGame->btnEP->isVisible();
 	s.selectMin = f.select_min;
 	s.selectMax = f.select_max;
+	s.selectablePositions = (s.curMsg == MSG_SELECT_POSITION) ? g_selectablePositions.load() : 0;
 	s.selectCancelable = f.select_cancelable;
 	s.selectableCount = (int)f.selectable_cards.size();
 	// task-50: MSG_ANNOUNCE_NUMBER(143) offers explicit int32 values

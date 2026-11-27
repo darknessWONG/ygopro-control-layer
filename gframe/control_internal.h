@@ -178,6 +178,7 @@ struct Snapshot {
 	bool canEp{ false };
 	int selectMin{ 0 };
 	int selectMax{ 0 };
+	unsigned selectablePositions{ 0 }; // task-61: legal POS_* mask for MSG_SELECT_POSITION
 	bool selectCancelable{ false };
 	int selectableCount{ 0 };
 	int sumTarget{ 0 };
@@ -418,6 +419,7 @@ extern std::atomic<uint64_t> g_ctosRespAtMsgBegin;
 // client auto-declines (count==0 && specount!=0x7f) even when the CTOS hook misses the response.
 extern std::atomic<int> g_lastChainRawCount;
 extern std::atomic<int> g_lastChainRawSpecount;
+extern std::atomic<unsigned> g_selectablePositions; // task-61: POS_* mask from MSG_SELECT_POSITION
 
 // ---------------------------------------------------------------------------
 // task-28: reconnect basics (network liveness + journal + modal suppression)
