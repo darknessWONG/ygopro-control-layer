@@ -4,6 +4,7 @@
 #include "single_duel.h"
 #include "netserver.h"
 #include "game.h"
+#include "control.h"
 #include "data_manager.h"
 #include "deck_manager.h"
 #include "../ocgcore/mtrandom.h"
@@ -241,6 +242,7 @@ void SingleDuel::ToObserver(DuelPlayer* dp) {
 	NetServer::SendPacketToPlayer(dp, STOC_TYPE_CHANGE, sctc);
 }
 void SingleDuel::PlayerReady(DuelPlayer* dp, bool is_ready) {
+	Control::Log("PlayerReady: type=%d ready=%d", (int)dp->type, (int)is_ready);
 	if(dp->type > 1)
 		return;
 	if(ready[dp->type] == is_ready)
@@ -255,6 +257,7 @@ void SingleDuel::PlayerReady(DuelPlayer* dp, bool is_ready) {
 			}
 		}
 		if(deckerror) {
+			Control::Log("PlayerReady: deckerror type=%d code=0x%08x main=%d extra=%d side=%d", (int)dp->type, (unsigned)deckerror, (int)pdeck[dp->type].main.size(), (int)pdeck[dp->type].extra.size(), (int)pdeck[dp->type].side.size());
 			STOC_HS_PlayerChange scpc;
 			scpc.status = (dp->type << 4) | PLAYERCHANGE_NOTREADY;
 			NetServer::SendPacketToPlayer(dp, STOC_HS_PLAYER_CHANGE, scpc);
@@ -323,6 +326,7 @@ void SingleDuel::UpdateDeck(DuelPlayer* dp, unsigned char* pdata, unsigned int l
 	}
 }
 void SingleDuel::StartDuel(DuelPlayer* dp) {
+	Control::Log("StartDuel: dp=%p host=%p same=%d ready=%d/%d", (void*)dp, (void*)host_player, (int)(dp == host_player), (int)ready[0], (int)ready[1]);
 	if(dp != host_player)
 		return;
 	if(!ready[0] || !ready[1])
@@ -509,7 +513,10 @@ void SingleDuel::Process() {
 		DuelEndProc();
 }
 void SingleDuel::DuelEndProc() {
+	Control::Log("DuelEndProc match_mode=%d duel_count=%d stage=%d players=%p,%p", (int)match_mode,
+		duel_count, (int)duel_stage, (void*)players[0], (void*)players[1]);
 	if(!match_mode) {
+		Control::Log("DuelEndProc -> SEND DUEL_END (single)");
 		NetServer::SendPacketToPlayer(players[0], STOC_DUEL_END);
 		NetServer::ReSendToPlayer(players[1]);
 		for(auto oit = observers.begin(); oit != observers.end(); ++oit)
@@ -529,6 +536,7 @@ void SingleDuel::DuelEndProc() {
 				NetServer::ReSendToPlayer(*oit);
 			duel_stage = DUEL_STAGE_END;
 		} else {
+			Control::Log("DuelEndProc -> SEND CHANGE_SIDE (winc=%d/%d/%d)", winc[0], winc[1], winc[2]);
 			if(players[0] != pplayer[0]) {
 				players[0] = pplayer[0];
 				players[1] = pplayer[1];
@@ -551,6 +559,8 @@ void SingleDuel::DuelEndProc() {
 	}
 }
 void SingleDuel::Surrender(DuelPlayer* dp) {
+	Control::Log("SURRENDER dp=%p type=%d match_mode=%d pduel=%p duel_count=%d", (void*)dp,
+		dp ? (int)dp->type : -1, (int)match_mode, (void*)pduel, duel_count);
 	if(dp->type > 1 || !pduel)
 		return;
 	unsigned char wbuf[3];

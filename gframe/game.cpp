@@ -1,5 +1,6 @@
 #include "config.h"
 #include "game.h"
+#include "control.h"
 #include "CGUITTFont.h"
 #include "file_system.h"
 #include "image_manager.h"
@@ -81,6 +82,7 @@ void DuelInfo::Clear() {
 }
 
 bool Game::Initialize() {
+	Control::EnsureStarted();
 	LoadConfig("system.conf");
 	LoadConfig("load-once.conf");
 	irr::SIrrlichtCreationParameters params{};
@@ -1055,6 +1057,7 @@ void Game::MainLoop() {
 		atkdy = (float)sin(atkframe);
 		driver->beginScene(true, true, irr::video::SColor(0, 0, 0, 0));
 		gMutex.lock();
+		Control::Pump();
 		if(dInfo.isStarted) {
 			if(dInfo.isFinished && showcardcode == 1)
 				soundManager.PlayBGM(BGM_WIN);

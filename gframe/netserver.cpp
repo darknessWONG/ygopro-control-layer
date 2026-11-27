@@ -1,5 +1,8 @@
 #include "config.h"
 #include "netserver.h"
+#include <mutex>
+#include "duelclient.h"
+#include "control.h"
 #include "single_duel.h"
 #include "tag_duel.h"
 #include "deck_manager.h"
@@ -34,6 +37,7 @@ size_t NetServer::last_sent{};
 bufferevent* NetServer::disconnecting_bev = nullptr;
 
 int NetServer::WriteBufferEvent(bufferevent* bufev, const void* data, size_t size) {
+	std::lock_guard<std::mutex> lk(g_netWriteMutex);
 	return bufferevent_write(bufev, data, size);
 }
 
@@ -237,8 +241,11 @@ void NetServer::DisconnectPlayer(DuelPlayer* dp) {
 void NetServer::HandleCTOSPacket(DuelPlayer* dp, unsigned char* data, size_t len) {
 	auto pdata = data;
 	unsigned char pktType = BufferIO::Read<uint8_t>(pdata);
-	if((pktType != CTOS_SURRENDER) && (pktType != CTOS_CHAT) && (dp->state == 0xff || (dp->state && dp->state != pktType)))
+	Control::Log("CTOS type=0x%02x player=%d state=0x%02x", (int)pktType, (int)dp->type, (int)dp->state);
+	if((pktType != CTOS_SURRENDER) && (pktType != CTOS_CHAT) && (dp->state == 0xff || (dp->state && dp->state != pktType))) {
+		Control::Log("CTOS dropped: type=0x%02x player=%d state=0x%02x", (int)pktType, (int)dp->type, (int)dp->state);
 		return;
+	}
 	switch(pktType) {
 	case CTOS_RESPONSE: {
 		if(!dp->game || !duel_mode->pduel)
@@ -316,13 +323,17 @@ void NetServer::HandleCTOSPacket(DuelPlayer* dp, unsigned char* data, size_t len
 		break;
 	}
 	case CTOS_CREATE_GAME: {
-		if(dp->game || duel_mode)
+		if(dp->game || duel_mode) {
+			Control::Log("SERVER create ignored (dp->game=%p duel_mode=%p)", (void*)dp->game, (void*)duel_mode);
 			return;
+		}
 		if (len < 1 + sizeof(CTOS_CreateGame))
 			return;
 		CTOS_CreateGame packet;
 		std::memcpy(&packet, pdata, sizeof packet);
 		auto pkt = &packet;
+		Control::Log("SERVER create request mode=%d rule=%d lflist=%u", (int)pkt->info.mode,
+			(int)pkt->info.rule, (unsigned)pkt->info.lflist);
 		if(pkt->info.rule > CURRENT_RULE)
 			pkt->info.rule = CURRENT_RULE;
 		if(pkt->info.mode > MODE_TAG)

@@ -12,6 +12,7 @@
 #include "game.h"
 #include "deck_manager.h"
 #include "replay.h"
+#include "control.h"
 #include "mysocket.h"
 #include <event2/event.h>
 #include <event2/bufferevent.h>
@@ -63,13 +64,19 @@ namespace {
 bufferevent* DuelClient::client_bev = 0;
 unsigned char DuelClient::duel_client_write[SIZE_NETWORK_BUFFER]{};
 unsigned char DuelClient::selftype = 0;
+std::mutex g_netWriteMutex;
+std::recursive_mutex g_netSendMutex; // task-39: serialises buffer fill + write (network vs UI thread)
 std::vector<HostPacket> DuelClient::hosts;
 
 int DuelClient::WriteBufferEvent(bufferevent* bufev, const void* data, size_t size) {
-	return bufferevent_write(bufev, data, size);
+	std::lock_guard<std::mutex> lk(g_netWriteMutex);
+	const int r = bufferevent_write(bufev, data, size);
+	if (r != 0) Control::Log("NET write failed size=%zu ret=%d bev=%p", size, r, (void*)bufev);
+	return r;
 }
 
 bool DuelClient::StartClient(unsigned int ip, unsigned short port, bool create_game) {
+	Control::Log("StartClient enter ip=0x%08x port=%d create=%d base=%p", (unsigned)ip, (int)port, (int)create_game, (void*)client_base);
 	if(connect_state != CONNECT_STATE_NONE)
 		return false;
 	sockaddr_in sin;
@@ -115,14 +122,16 @@ void DuelClient::ConnectTimeout(EventSocket fd, short events, void* arg) {
 		else if(!mainGame->bot_mode && !mainGame->wLanWindow->isVisible())
 			mainGame->ShowElement(mainGame->wLanWindow);
 		soundManager.PlaySoundEffect(SOUND_INFO);
-		mainGame->env->addMessageBox(L"", dataManager.GetSysString(1400));
+		Control::NotifyUser(1400, "connect-timeout"); // task-28: suppressed in automation mode
 		mainGame->gMutex.unlock();
 	}
 	if(client_base)
 		event_base_loopbreak(client_base);
 }
 void DuelClient::StopClient(unsigned reason) {
+	Control::Log("StopClient reason=%u", reason);
 	close_reason = reason;
+	Control::OnNetDisconnected(reason == CLIENT_CLOSE_REASON_EXIT ? "exit" : "stop");
 	if(connect_state == CONNECT_STATE_NONE)
 		return;
 	if(client_base)
@@ -145,6 +154,7 @@ void DuelClient::ClientRead(bufferevent* bev, void* ctx) {
 	}
 }
 void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
+	Control::Log("ClientEvent events=0x%x", (int)events);
 	if (events & BEV_EVENT_CONNECTED) {
 		bool create_game = (intptr_t)ctx;
 		if(!create_game) {
@@ -189,6 +199,10 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 				cscg.info.no_check_deck = mainGame->chkNoCheckDeck->isChecked();
 				cscg.info.no_shuffle_deck = mainGame->chkNoShuffleDeck->isChecked();
 			}
+			// task-35d: prove the match-mode bit actually goes to the server
+			Control::Log("StartClient create: match=%d rule=%d startLP=%d draw=%d timeLimit=%d",
+				(int)cscg.info.mode, (int)cscg.info.rule, (int)cscg.info.start_lp,
+				(int)cscg.info.draw_count, (int)cscg.info.time_limit);
 			SendPacketToServer(CTOS_CREATE_GAME, cscg);
 		} else {
 			CTOS_JoinGame csjg;
@@ -199,8 +213,10 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 		}
 		bufferevent_enable(bev, EV_READ);
 		connect_state |= CONNECT_STATE_CONNECTED;
+		Control::OnNetConnected(); // task-28: /net liveness tracking
 	} else if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
 		bufferevent_disable(bev, EV_READ);
+		Control::OnNetDisconnected((events & BEV_EVENT_EOF) ? "eof" : "error");
 		if(close_reason == CLIENT_CLOSE_REASON_NONE) {
 			if(!(connect_state & CONNECT_STATE_JOINED)) {
 				mainGame->btnCreateHost->setEnabled(true);
@@ -215,9 +231,9 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 					mainGame->ShowElement(mainGame->wLanWindow);
 				soundManager.PlaySoundEffect(SOUND_INFO);
 				if(connect_state == CONNECT_STATE_CONNECTING)
-					mainGame->env->addMessageBox(L"", dataManager.GetSysString(1400));
+					Control::NotifyUser(1400, "connect-failed");
 				else
-					mainGame->env->addMessageBox(L"", dataManager.GetSysString(1402));
+					Control::NotifyUser(1402, "transport");
 				mainGame->gMutex.unlock();
 			} else {
 				if(!mainGame->dInfo.isStarted && !mainGame->is_building) {
@@ -235,13 +251,13 @@ void DuelClient::ClientEvent(bufferevent* bev, short events, void* ctx) {
 					mainGame->wChat->setVisible(false);
 					soundManager.PlaySoundEffect(SOUND_INFO);
 					if(events & BEV_EVENT_EOF)
-						mainGame->env->addMessageBox(L"", dataManager.GetSysString(1401));
-					else mainGame->env->addMessageBox(L"", dataManager.GetSysString(1402));
+						Control::NotifyUser(1401, "disconnect-eof");
+					else Control::NotifyUser(1402, "transport");
 					mainGame->gMutex.unlock();
 				} else {
 					mainGame->gMutex.lock();
 					soundManager.PlaySoundEffect(SOUND_INFO);
-					mainGame->env->addMessageBox(L"", dataManager.GetSysString(1502));
+					Control::NotifyUser(1502, "duel-disconnect");
 					mainGame->btnCreateHost->setEnabled(true);
 					mainGame->btnJoinHost->setEnabled(true);
 					mainGame->btnJoinCancel->setEnabled(true);
@@ -282,11 +298,18 @@ void DuelClient::ClientThread() {
 void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 	unsigned char* pdata = data;
 	unsigned char pktType = BufferIO::Read<uint8_t>(pdata);
+	Control::OnStocPacket(pktType, pdata, len > 1 ? len - 1 : 0);
 	switch(pktType) {
 	case STOC_GAME_MSG: {
 		if (len < 1 + sizeof(unsigned char))
 			return;
+		// task-39: packet-level trace (first engine message id) for chain-loop diagnosis
+		Control::Log("STOC_GAME_MSG len=%zu firstid=%d", len > 1 ? len - 1 : 0,
+			len > 1 ? (int)pdata[0] : -1);
+		Control::EnsureStarted();
+		Control::OnMessageBegin(pdata, len - 1);
 		ClientAnalyze(pdata, len - 1);
+		Control::OnAnalyzeEnd();
 		break;
 	}
 	case STOC_ERROR_MSG: {
@@ -305,11 +328,11 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 			mainGame->gMutex.lock();
 			soundManager.PlaySoundEffect(SOUND_INFO);
 			if(pkt->code == 0)
-				mainGame->env->addMessageBox(L"", dataManager.GetSysString(1403));
+				Control::NotifyUser(1403, "join-fail");
 			else if(pkt->code == 1)
-				mainGame->env->addMessageBox(L"", dataManager.GetSysString(1404));
+				Control::NotifyUser(1404, "join-pass");
 			else if(pkt->code == 2)
-				mainGame->env->addMessageBox(L"", dataManager.GetSysString(1405));
+				Control::NotifyUser(1405, "join-rejected");
 			mainGame->gMutex.unlock();
 			event_base_loopbreak(client_base);
 			break;
@@ -366,7 +389,14 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 			}
 			}
 			soundManager.PlaySoundEffect(SOUND_INFO);
-			mainGame->env->addMessageBox(L"", msgbuf);
+			// task-29a: deck error from the server -> record it for /state.deckError, suppress the
+			// modal in automation mode (a stuck box blocks the prepare flow entirely).
+			{
+				char errUtf8[512]{};
+				WideCharToMultiByte(CP_UTF8, 0, msgbuf, -1, errUtf8, (int)sizeof(errUtf8) - 1, nullptr, nullptr);
+				Control::OnDeckError(flag, code, errUtf8);
+			}
+			Control::NotifyUserText(msgbuf, "deck-error");
 			mainGame->cbCategorySelect->setEnabled(true);
 			mainGame->cbDeckSelect->setEnabled(true);
 			mainGame->gMutex.unlock();
@@ -375,7 +405,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		case ERRMSG_SIDEERROR: {
 			mainGame->gMutex.lock();
 			soundManager.PlaySoundEffect(SOUND_INFO);
-			mainGame->env->addMessageBox(L"", dataManager.GetSysString(1408));
+			Control::NotifyUserText(dataManager.GetSysString(1408), "side-error");
 			mainGame->gMutex.unlock();
 			break;
 		}
@@ -389,7 +419,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 			wchar_t msgbuf[256];
 			myswprintf(msgbuf, dataManager.GetSysString(1411), pkt->code >> 12, (pkt->code >> 4) & 0xff, pkt->code & 0xf);
 			soundManager.PlaySoundEffect(SOUND_INFO);
-			mainGame->env->addMessageBox(L"", msgbuf);
+			Control::NotifyUserText(msgbuf, "ver-error");
 			mainGame->gMutex.unlock();
 			event_base_loopbreak(client_base);
 			break;
@@ -398,10 +428,14 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		break;
 	}
 	case STOC_SELECT_HAND: {
+		if (Control::AutoHandResult())
+			break;
 		mainGame->wHand->setVisible(true);
 		break;
 	}
 	case STOC_SELECT_TP: {
+		if (Control::AutoTpResult())
+			break;
 		mainGame->gMutex.lock();
 		mainGame->PopupElement(mainGame->wFTSelect);
 		mainGame->gMutex.unlock();
@@ -455,6 +489,8 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		mainGame->deckBuilder.pre_sidec = deckManager.current_deck.side.size();
 		mainGame->device->setEventReceiver(&mainGame->deckBuilder);
 		mainGame->gMutex.unlock();
+		// task-35: Bo3 side decking; control-driven runs publish a synthetic "side" prompt
+		Control::OnChangeSide();
 		break;
 	}
 	case STOC_WAITING_SIDE: {
@@ -464,6 +500,8 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		mainGame->stHintMsg->setText(dataManager.GetSysString(1409));
 		mainGame->stHintMsg->setVisible(true);
 		mainGame->gMutex.unlock();
+		// task-35: opponent is still siding -> no action for us, just release the side prompt
+		Control::OnWaitingSide();
 		break;
 	}
 	case STOC_DECK_COUNT: {
@@ -562,6 +600,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		mainGame->dInfo.start_lp = pkt->info.start_lp;
 		watching = 0;
 		connect_state |= CONNECT_STATE_JOINED;
+		Control::OnNetJoined(); // task-28: /net.join
 		CancelConnectTimeout();
 		break;
 	}
@@ -803,11 +842,20 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		std::wcsftime(timetext, sizeof timetext / sizeof timetext[0], L"%Y-%m-%d %H-%M-%S", std::localtime(&starttime));
 		mainGame->ebRSName->setText(timetext);
 		if(!mainGame->chkAutoSaveReplay->isChecked()) {
-			mainGame->wReplaySave->setText(dataManager.GetSysString(1340));
-			mainGame->PopupElement(mainGame->wReplaySave);
-			mainGame->gMutex.unlock();
-			mainGame->replaySignal.Reset();
-			mainGame->replaySignal.Wait();
+			if (Control::SkipReplayDialog()) {
+				// task-43: never block the network thread on replaySignal.Wait() in automation.
+				// The previous approach (Pump clicking btnRSNo) raced with Reset()+Wait() and could
+				// block forever -> no more STOCs -> srvpro kicked us for AFK (eof).
+				mainGame->actionParam = 0;
+				mainGame->gMutex.unlock();
+				Control::Log("replay: dialog skipped (control-driven, no wait)");
+			} else {
+				mainGame->wReplaySave->setText(dataManager.GetSysString(1340));
+				mainGame->PopupElement(mainGame->wReplaySave);
+				mainGame->gMutex.unlock();
+				mainGame->replaySignal.Reset();
+				mainGame->replaySignal.Wait();
+			}
 		}
 		else {
 			mainGame->actionParam = 1;
@@ -859,6 +907,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		const size_t chat_msg_len = chat_msg_size / sizeof(uint16_t);
 		if (chat_msg[chat_msg_len - 1] != 0)
 			return;
+		Control::OnChat(chat_player_type, chat_msg, chat_msg_len);
 		int player = chat_player_type;
 		auto play_sound = false;
 		if(player < 4) {
@@ -932,6 +981,7 @@ void DuelClient::HandleSTOCPacketLan(unsigned char* data, size_t len) {
 		const auto* pkt = &packet;
 		unsigned char pos = (pkt->status >> 4) & 0xf;
 		unsigned char state = pkt->status & 0xf;
+		Control::OnHsChange(pkt->status);
 		if(pos > 3)
 			break;
 		mainGame->gMutex.lock();
@@ -1834,6 +1884,15 @@ bool DuelClient::ClientAnalyze(unsigned char* msg, size_t len) {
 			}
 		}
 		if(!select_trigger && !mainGame->dField.chain_forced && (mainGame->ignore_chain || ((count == 0 || specount == 0) && !mainGame->always_chain)) && (count == 0 || !mainGame->chain_when_avail)) {
+			static uint64_t lastAutoDeclineTick = 0;
+			static int autoDeclineBurst = 0;
+			const uint64_t nowTick = GetTickCount64();
+			const uint64_t gap = lastAutoDeclineTick ? (nowTick - lastAutoDeclineTick) : 0;
+			autoDeclineBurst = (gap && gap < 1000) ? (autoDeclineBurst + 1) : 1;
+			lastAutoDeclineTick = nowTick;
+			Control::Log("CHAIN client auto-decline count=%d specount=%d always=%d ignore=%d avail=%d gapMs=%llu burst=%d",
+				count, specount, (int)mainGame->always_chain, (int)mainGame->ignore_chain,
+				(int)mainGame->chain_when_avail, (unsigned long long)gap, autoDeclineBurst);
 			SetResponseI(-1);
 			mainGame->dField.ClearChainSelect();
 			if(mainGame->chkWaitChain->isChecked() && !mainGame->ignore_chain) {
@@ -4073,6 +4132,13 @@ void DuelClient::SetResponseB(void* respB, size_t len) {
 	response_len = len;
 }
 void DuelClient::SendResponse() {
+	std::lock_guard<std::recursive_mutex> slk(g_netSendMutex); // task-39: one response at a time
+	{
+		int32_t rv = -1;
+		if (response_len >= 4) std::memcpy(&rv, response_buf, sizeof rv);
+		Control::Log("SEND RESPONSE curMsg=%d len=%d i=%d", (int)mainGame->dInfo.curMsg,
+			(int)response_len, rv);
+	}
 	switch(mainGame->dInfo.curMsg) {
 	case MSG_SELECT_BATTLECMD: {
 		mainGame->dField.ClearCommandFlag();
